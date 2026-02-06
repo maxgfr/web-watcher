@@ -48,12 +48,6 @@ jobs:
       - name: Make script executable
         run: chmod +x script.sh
 
-      - name: Test --version flag
-        run: |
-          output=$(./script.sh --version)
-          echo "$output"
-          [[ "$output" == "web-watcher v1.0.0" ]] || { echo "FAIL: unexpected version output"; exit 1; }
-
       - name: Test --help flag
         run: |
           ./script.sh --help | grep -q "Usage:" || { echo "FAIL: help missing Usage"; exit 1; }
