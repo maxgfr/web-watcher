@@ -78,7 +78,7 @@ sudo pacman -S curl jq
 
 ## Usage
 
-```
+```bash
 web-watcher [options] <url>
 ```
 
