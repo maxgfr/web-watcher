@@ -1,0 +1,103 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  shellcheck:
+    name: ShellCheck Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install ShellCheck
+        run: sudo apt-get install -y shellcheck
+
+      - name: Run ShellCheck
+        run: shellcheck -s bash -S warning script.sh
+
+  syntax:
+    name: Bash Syntax Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check syntax
+        run: bash -n script.sh
+
+  test:
+    name: Functional Tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install jq
+        run: |
+          if [[ "$RUNNER_OS" == "Linux" ]]; then
+            sudo apt-get install -y jq
+          elif [[ "$RUNNER_OS" == "macOS" ]]; then
+            brew install jq
+          fi
+
+      - name: Make script executable
+        run: chmod +x script.sh
+
+      - name: Test --version flag
+        run: |
+          output=$(./script.sh --version)
+          echo "$output"
+          [[ "$output" == "web-watcher v1.0.0" ]] || { echo "FAIL: unexpected version output"; exit 1; }
+
+      - name: Test --help flag
+        run: |
+          ./script.sh --help | grep -q "Usage:" || { echo "FAIL: help missing Usage"; exit 1; }
+          ./script.sh --help | grep -q "\-\-once" || { echo "FAIL: help missing --once"; exit 1; }
+          ./script.sh --help | grep -q "\-\-baseline-file" || { echo "FAIL: help missing --baseline-file"; exit 1; }
+
+      - name: Test missing URL error
+        run: |
+          ./script.sh 2>&1 && { echo "FAIL: should have exited non-zero"; exit 1; } || true
+
+      - name: Test invalid URL scheme error
+        run: |
+          ./script.sh ftp://example.com 2>&1 | grep -q "must start with http" || { echo "FAIL: should reject non-http URL"; exit 1; }
+
+      - name: Test unknown option error
+        run: |
+          ./script.sh --bogus 2>&1 | grep -q "Unknown option" || { echo "FAIL: should report unknown option"; exit 1; }
+
+      - name: Test --once baseline capture (live API)
+        run: |
+          ./script.sh --once --no-color --no-sound https://httpbin.org/get 2>&1 | grep -q "Baseline" || { echo "FAIL: --once should capture baseline"; exit 1; }
+
+      - name: Test --once with --baseline-file persistence
+        run: |
+          # First run: capture baseline
+          ./script.sh --once --baseline-file /tmp/ww_test_baseline.txt --no-color --no-sound https://httpbin.org/uuid 2>&1
+          [[ -f /tmp/ww_test_baseline.txt ]] || { echo "FAIL: baseline file not created"; exit 1; }
+          echo "Baseline file created OK"
+
+          # Second run: compare (uuid changes every time → should detect change)
+          rc=0
+          ./script.sh --once --baseline-file /tmp/ww_test_baseline.txt --no-color --no-sound https://httpbin.org/uuid 2>&1 || rc=$?
+          echo "Exit code: $rc"
+          [[ "$rc" -eq 2 ]] || { echo "FAIL: expected exit code 2 (change detected), got $rc"; exit 1; }
+          echo "Change detection OK"
+
+      - name: Test --once with jq filter
+        run: |
+          ./script.sh --once -f '.origin' --no-color --no-sound https://httpbin.org/get 2>&1 | grep -q "Baseline" || { echo "FAIL: jq filter should work"; exit 1; }
+
+      - name: Test invalid interval
+        run: |
+          ./script.sh -i 0 https://example.com 2>&1 | grep -q "positive integer" || { echo "FAIL: should reject interval 0"; exit 1; }
+
+      - name: Test invalid mode
+        run: |
+          ./script.sh -m invalid https://example.com 2>&1 | grep -q "must be one of" || { echo "FAIL: should reject invalid mode"; exit 1; }
