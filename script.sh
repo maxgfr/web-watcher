@@ -616,8 +616,15 @@ calculate_change_percent() {
         old_lines=1
     fi
 
-    # Count differing lines
-    changed_lines=$(diff <(echo "$old") <(echo "$new") 2>/dev/null | grep -c '^[<>]' || true)
+    # Count differing lines (each side separately to avoid double-counting)
+    local removed_count added_count
+    removed_count=$(diff <(echo "$old") <(echo "$new") 2>/dev/null | grep -c '^<' || true)
+    added_count=$(diff <(echo "$old") <(echo "$new") 2>/dev/null | grep -c '^>' || true)
+    if [ "$removed_count" -gt "$added_count" ]; then
+        changed_lines="$removed_count"
+    else
+        changed_lines="$added_count"
+    fi
 
     # Percentage relative to total lines
     local total_lines
