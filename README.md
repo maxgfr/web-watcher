@@ -27,6 +27,16 @@
 
 ## Installation
 
+### Homebrew
+
+If you use Homebrew, you can install `web-watcher` via the tap:
+
+```bash
+brew tap maxgfr/tap
+brew install maxgfr/tap/web-watcher
+web-watcher --help
+```
+
 ### Manual
 
 ```bash
