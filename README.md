@@ -230,24 +230,24 @@ Exit codes for `--once` mode:
 
 ```
 ┌─────────────────┐
-│   Fetch URL      │ ← curl with headers, auth, cookies, retries
+│   Fetch URL     │ ← curl with headers, auth, cookies, retries
 └────────┬────────┘
          │
 ┌────────▼────────┐
-│  Detect Mode     │ ← auto / api / website (from Content-Type)
+│  Detect Mode    │ ← auto / api / website (from Content-Type)
 └────────┬────────┘
          │
 ┌────────▼────────┐
-│ Process Content  │ ← jq filter → grep selector → strip HTML
+│ Process Content │ ← jq filter → grep selector → strip HTML
 └────────┬────────┘
          │
 ┌────────▼────────┐
-│ Compare with     │ ← diff-based change % calculation
-│ Previous         │
+│ Compare with    │ ← diff-based change % calculation
+│ Previous        │
 └────────┬────────┘
          │
     ┌────▼────┐
-    │ Changed? │
+    │ Changed?│
     └────┬────┘
      No  │  Yes
      │   │
