@@ -8,7 +8,7 @@
 set -euo pipefail
 
 # --- Configuration & Defaults ---
-VERSION="1.0.2"
+VERSION="1.0.3"
 DEFAULT_INTERVAL=30
 DEFAULT_THRESHOLD=0
 DEFAULT_METHOD="GET"
