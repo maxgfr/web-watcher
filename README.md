@@ -15,6 +15,7 @@
 - **Auto-detection** — automatically detects JSON vs HTML from `Content-Type`
 - **Change threshold** — set a minimum % of change to trigger alerts (ignore noise)
 - **Desktop notifications** — native macOS (`osascript`) and Linux (`notify-send`) support
+- **Slack, Discord & Telegram** — webhook notifications to messaging platforms
 - **jq filtering** — target specific JSON fields (e.g. `.products[].price`)
 - **HTML selector** — grep patterns to monitor specific parts of a page
 - **Custom headers & auth** — Bearer tokens, cookies, Basic auth, custom User-Agent
@@ -126,6 +127,15 @@ web-watcher [options] <url>
 | `-f, --filter <jq>` | jq filter for JSON (e.g. `.data.price`) | — |
 | `-s, --selector <pattern>` | Grep pattern for HTML content | — |
 | `--strip-html` | Force strip HTML tags | disabled |
+
+### Notification Options
+
+| Option | Description | Default |
+|---|---|---|
+| `--slack <url>` | Slack incoming webhook URL | — |
+| `--discord <url>` | Discord webhook URL | — |
+| `--telegram-token <token>` | Telegram bot token | — |
+| `--telegram-chat <chat_id>` | Telegram chat ID | — |
 
 ### Output Options
 
@@ -267,7 +277,41 @@ Exit codes for `--once` mode:
 |---|---|
 | macOS | `osascript` — native Notification Center with sound |
 | Linux | `notify-send` — standard desktop notification |
+| Slack | Incoming webhook — posts to a channel |
+| Discord | Webhook — posts to a channel |
+| Telegram | Bot API — sends a message to a chat |
 | All | Terminal bell (`\a`) + colored terminal output |
+
+### Slack
+
+1. Create an [Incoming Webhook](https://api.slack.com/messaging/webhooks) in your Slack workspace
+2. Pass the webhook URL with `--slack`:
+
+```bash
+./script.sh --slack https://hooks.slack.com/services/T.../B.../xxx \
+  -i 30 https://api.example.com/data
+```
+
+### Discord
+
+1. In your Discord channel, go to **Settings > Integrations > Webhooks** and create a webhook
+2. Pass the webhook URL with `--discord`:
+
+```bash
+./script.sh --discord https://discord.com/api/webhooks/123/abc \
+  -i 30 https://api.example.com/data
+```
+
+### Telegram
+
+1. Create a bot with [@BotFather](https://t.me/BotFather) and get the bot token
+2. Get your chat ID by messaging the bot and checking `https://api.telegram.org/bot<token>/getUpdates`
+3. Pass both with `--telegram-token` and `--telegram-chat`:
+
+```bash
+./script.sh --telegram-token 123456:ABC-DEF --telegram-chat 987654321 \
+  -i 30 https://api.example.com/data
+```
 
 ## Tips
 

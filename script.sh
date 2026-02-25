@@ -48,6 +48,10 @@ MAX_RUNS=0
 STRIP_HTML=false
 HAS_DIFF=false
 BASELINE_FILE=""
+SLACK_WEBHOOK=""
+DISCORD_WEBHOOK=""
+TELEGRAM_TOKEN=""
+TELEGRAM_CHAT_ID=""
 
 # --- Colors ---
 setup_colors() {
@@ -119,6 +123,11 @@ send_notification() {
         notify-send "$title" "$message" 2>/dev/null || true
     fi
 
+    # Webhook notifications
+    [ -n "$SLACK_WEBHOOK" ] && send_slack "$title" "$message"
+    [ -n "$DISCORD_WEBHOOK" ] && send_discord "$title" "$message"
+    [ -n "$TELEGRAM_TOKEN" ] && [ -n "$TELEGRAM_CHAT_ID" ] && send_telegram "$title" "$message"
+
     # Always print to terminal
     echo ""
     echo -e "${RED}${BOLD}╔══════════════════════════════════════════════════════════════╗${NC}"
@@ -128,6 +137,31 @@ send_notification() {
     echo -e "  ${BOLD}Time:${NC} $(date '+%Y-%m-%d %H:%M:%S')"
     echo -e "  ${BOLD}Info:${NC} $message"
     echo ""
+}
+
+# --- Webhook Notifications ---
+
+send_slack() {
+    local title="$1" message="$2"
+    curl -s -X POST -H 'Content-Type: application/json' \
+        -d "{\"text\":\"*${title}*\n${message}\n${URL}\"}" \
+        "$SLACK_WEBHOOK" >/dev/null 2>&1 || log_warn "Slack notification failed"
+}
+
+send_discord() {
+    local title="$1" message="$2"
+    curl -s -X POST -H 'Content-Type: application/json' \
+        -d "{\"content\":\"**${title}**\n${message}\n${URL}\"}" \
+        "$DISCORD_WEBHOOK" >/dev/null 2>&1 || log_warn "Discord notification failed"
+}
+
+send_telegram() {
+    local title="$1" message="$2"
+    curl -s -X POST \
+        "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage" \
+        -d "chat_id=${TELEGRAM_CHAT_ID}&text=${title}
+${message}
+${URL}&parse_mode=Markdown" >/dev/null 2>&1 || log_warn "Telegram notification failed"
 }
 
 # --- Banner ---
@@ -183,6 +217,12 @@ print_usage() {
     echo "  -f, --filter <jq_expr>      jq filter for JSON responses (e.g., '.data.price')"
     echo "  -s, --selector <pattern>    Grep pattern to extract specific content from HTML"
     echo "  --strip-html                Force HTML tag stripping (useful with --mode api)"
+    echo ""
+    echo "Notification Options:"
+    echo "  --slack <url>               Slack incoming webhook URL"
+    echo "  --discord <url>             Discord webhook URL"
+    echo "  --telegram-token <token>    Telegram bot token"
+    echo "  --telegram-chat <chat_id>   Telegram chat ID"
     echo ""
     echo "Output Options:"
     echo "  -l, --log <file>            Log changes to a file"
@@ -354,6 +394,22 @@ parse_args() {
             --strip-html)
                 STRIP_HTML=true
                 shift
+                ;;
+            --slack)
+                SLACK_WEBHOOK="${2:?'--slack requires a value'}"
+                shift 2
+                ;;
+            --discord)
+                DISCORD_WEBHOOK="${2:?'--discord requires a value'}"
+                shift 2
+                ;;
+            --telegram-token)
+                TELEGRAM_TOKEN="${2:?'--telegram-token requires a value'}"
+                shift 2
+                ;;
+            --telegram-chat)
+                TELEGRAM_CHAT_ID="${2:?'--telegram-chat requires a value'}"
+                shift 2
                 ;;
             -l|--log)
                 LOG_FILE="${2:?'--log requires a value'}"
@@ -712,6 +768,15 @@ print_watch_config() {
     fi
     if [ "$MAX_RUNS" -gt 0 ]; then
         echo -e "  ${CYAN}Max runs:${NC}   $MAX_RUNS"
+    fi
+    # Notification channels
+    local channels=()
+    [ -n "$SLACK_WEBHOOK" ] && channels+=("Slack")
+    [ -n "$DISCORD_WEBHOOK" ] && channels+=("Discord")
+    [ -n "$TELEGRAM_TOKEN" ] && [ -n "$TELEGRAM_CHAT_ID" ] && channels+=("Telegram")
+    if [ ${#channels[@]} -gt 0 ]; then
+        local IFS=', '
+        echo -e "  ${CYAN}Notify:${NC}     ${channels[*]}"
     fi
     echo ""
 }
