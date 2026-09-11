@@ -683,13 +683,21 @@ strip_html_tags() {
         if command -v perl &>/dev/null; then stripper="perl"; else stripper="sed"; fi
     fi
     log_verbose "HTML stripper: $stripper"
-    if [ "$stripper" = perl ]; then
-        strip_html_tags_perl
-    else
-        strip_html_tags_sed
-    fi |
-    tr -s '[:space:]' '\n' |
-    sed '/^$/d'
+
+    # LC_ALL=C gives sed/tr/awk byte semantics. Under a UTF-8 locale they
+    # abort with "illegal byte sequence" on a page whose bytes are not valid
+    # UTF-8 (a Latin-1 page, say), which used to empty the extracted text.
+    # Every pattern here is ASCII, so UTF-8 sequences pass through untouched.
+    (
+        export LC_ALL=C
+        if [ "$stripper" = perl ]; then
+            strip_html_tags_perl
+        else
+            strip_html_tags_sed
+        fi |
+        tr -s '[:space:]' '\n' |
+        sed '/^$/d'
+    )
 }
 
 process_content() {
@@ -758,8 +766,8 @@ calculate_change_percent() {
 
     # Count differing lines (each side separately to avoid double-counting)
     local removed_count added_count
-    removed_count=$(diff <(printf '%s\n' "$old") <(printf '%s\n' "$new") 2>/dev/null | grep -ac '^<' || true)
-    added_count=$(diff <(printf '%s\n' "$old") <(printf '%s\n' "$new") 2>/dev/null | grep -ac '^>' || true)
+    removed_count=$(diff -a <(printf '%s\n' "$old") <(printf '%s\n' "$new") 2>/dev/null | grep -ac '^<' || true)
+    added_count=$(diff -a <(printf '%s\n' "$old") <(printf '%s\n' "$new") 2>/dev/null | grep -ac '^>' || true)
     if [ "$removed_count" -gt "$added_count" ]; then
         changed_lines="$removed_count"
     else
@@ -801,7 +809,7 @@ show_diff() {
     if [ "$HAS_DIFF" = true ]; then
         echo -e "${DIM}--- previous${NC}"
         echo -e "${DIM}+++ current${NC}"
-        diff <(printf '%s\n' "$old") <(printf '%s\n' "$new") 2>/dev/null | tail -n +3 || true
+        diff -a <(printf '%s\n' "$old") <(printf '%s\n' "$new") 2>/dev/null | tail -n +3 || true
     else
         echo -e "${YELLOW}(diff not available — install diffutils)${NC}"
     fi

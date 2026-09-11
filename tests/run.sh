@@ -422,6 +422,36 @@ t_telegram_http_error_is_reported() {
     assert_contains "$OUT" "[WARN] Telegram notification failed"
 }
 
+# Build an ISO-8859-1 page (bytes that are invalid in a UTF-8 locale).
+write_latin1_page() {
+    printf '<html><body><h1>Caf\351 du Commerce</h1>\n<p>Pr\350s de la gare \340 c\364t\351 &euro;</p>\n<script>var x = 1 < 2;</script>\n</body></html>\n' > "$SERVE/latin1.html"
+}
+
+t_website_mode_keeps_non_utf8_content() {
+    write_latin1_page
+    ww --once -m website --baseline-file "$TMP/baseline" "$BASE/latin1.html"
+    assert_rc 0
+    local text
+    text=$(cat "$TMP/baseline")
+    assert_contains "$text" "Commerce"
+    assert_contains "$text" "gare"
+    assert_contains "$text" "Caf"
+    assert_not_contains "$text" "var"
+    assert_not_contains "$text" "<"
+}
+
+t_website_mode_sed_fallback_keeps_non_utf8_content() {
+    write_latin1_page
+    WW_HTML_STRIPPER="sed" ww --once -m website --baseline-file "$TMP/baseline" "$BASE/latin1.html"
+    assert_rc 0
+    local text
+    text=$(cat "$TMP/baseline")
+    assert_contains "$text" "Commerce"
+    assert_contains "$text" "gare"
+    assert_not_contains "$text" "var"
+    assert_not_contains "$text" "<"
+}
+
 t_non_utf8_content_is_kept() {
     # Invalid UTF-8 bytes must not make grep treat the response as binary.
     printf 'abc\377\376def\nghi\n' > "$SERVE/bin.dat"
