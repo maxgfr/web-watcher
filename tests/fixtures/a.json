@@ -1,0 +1,11 @@
+{
+  "id": 1,
+  "name": "widget",
+  "price": 10,
+  "stock": 3,
+  "currency": "EUR",
+  "tags": ["a", "b"],
+  "active": true,
+  "rating": 4.5,
+  "vendor": "acme"
+}

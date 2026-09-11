@@ -118,7 +118,7 @@ send_notification() {
 
     # OS-level notification
     if [[ "$OSTYPE" == "darwin"* ]]; then
-        osascript -e "display notification \"$message\" with title \"$title\" sound name \"Glass\"" 2>/dev/null || true
+        osascript -e "display notification \"$(applescript_escape "$message")\" with title \"$(applescript_escape "$title")\" sound name \"Glass\"" 2>/dev/null || true
     elif command -v notify-send &>/dev/null; then
         notify-send "$title" "$message" 2>/dev/null || true
     fi
@@ -141,27 +141,55 @@ send_notification() {
 
 # --- Webhook Notifications ---
 
+# Escape a string for use inside a double-quoted AppleScript literal.
+applescript_escape() {
+    local s="$1"
+    s=${s//\\/\\\\}
+    s=${s//\"/\\\"}
+    printf '%s' "$s"
+}
+
+# Print $1 as a JSON string literal (quotes included).
+json_escape() {
+    local s="$1"
+    s=${s//\\/\\\\}
+    s=${s//\"/\\\"}
+    s=${s//$'\n'/\\n}
+    s=${s//$'\r'/\\r}
+    s=${s//$'\t'/\\t}
+    printf '"%s"' "$s"
+}
+
+# POST a JSON document to a webhook. -f makes HTTP 4xx/5xx a failure so the
+# caller can report it instead of silently losing the notification.
+post_json() {
+    local url="$1" payload="$2"
+    curl -fs -X POST -H 'Content-Type: application/json' --max-time "$TIMEOUT" \
+        -d "$payload" -- "$url" >/dev/null 2>&1
+}
+
 send_slack() {
-    local title="$1" message="$2"
-    curl -s -X POST -H 'Content-Type: application/json' \
-        -d "{\"text\":\"*${title}*\n${message}\n${URL}\"}" \
-        "$SLACK_WEBHOOK" >/dev/null 2>&1 || log_warn "Slack notification failed"
+    local title="$1" message="$2" text
+    text=$(json_escape "*${title}*"$'\n'"${message}"$'\n'"${URL}")
+    post_json "$SLACK_WEBHOOK" "{\"text\":${text}}" || log_warn "Slack notification failed"
 }
 
 send_discord() {
-    local title="$1" message="$2"
-    curl -s -X POST -H 'Content-Type: application/json' \
-        -d "{\"content\":\"**${title}**\n${message}\n${URL}\"}" \
-        "$DISCORD_WEBHOOK" >/dev/null 2>&1 || log_warn "Discord notification failed"
+    local title="$1" message="$2" text
+    text=$(json_escape "**${title}**"$'\n'"${message}"$'\n'"${URL}")
+    post_json "$DISCORD_WEBHOOK" "{\"content\":${text}}" || log_warn "Discord notification failed"
 }
 
 send_telegram() {
     local title="$1" message="$2"
-    curl -s -X POST \
-        "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage" \
-        -d "chat_id=${TELEGRAM_CHAT_ID}&text=${title}
-${message}
-${URL}&parse_mode=Markdown" >/dev/null 2>&1 || log_warn "Telegram notification failed"
+    local api="${WW_TELEGRAM_API:-https://api.telegram.org}"
+    # Fields are url-encoded (a "&" in the URL would otherwise start a new
+    # parameter) and sent as plain text: no parse_mode, so "_" and "*" in URLs
+    # need no escaping.
+    curl -fs -X POST --max-time "$TIMEOUT" \
+        --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+        --data-urlencode "text=${title}"$'\n'"${message}"$'\n'"${URL}" \
+        -- "${api}/bot${TELEGRAM_TOKEN}/sendMessage" >/dev/null 2>&1 || log_warn "Telegram notification failed"
 }
 
 # --- Banner ---
@@ -300,6 +328,15 @@ check_dependencies() {
 
 # --- Argument Parsing ---
 
+# require_int <option> <value> <min> — exit 1 unless value is an integer >= min
+require_int() {
+    local option="$1" value="$2" min="$3"
+    if ! [[ "$value" =~ ^[0-9]+$ ]] || [ "$value" -lt "$min" ]; then
+        log_error "$option must be an integer >= $min (got '$value')"
+        exit 1
+    fi
+}
+
 parse_args() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -329,6 +366,7 @@ parse_args() {
                 ;;
             --timeout)
                 TIMEOUT="${2:?'--timeout requires a value'}"
+                require_int "--timeout" "$TIMEOUT" 1
                 shift 2
                 ;;
             --no-follow)
@@ -341,10 +379,7 @@ parse_args() {
                 ;;
             -i|--interval)
                 INTERVAL="${2:?'--interval requires a value'}"
-                if ! [[ "$INTERVAL" =~ ^[0-9]+$ ]] || [ "$INTERVAL" -lt 1 ]; then
-                    log_error "Interval must be a positive integer (seconds)"
-                    exit 1
-                fi
+                require_int "--interval" "$INTERVAL" 1
                 shift 2
                 ;;
             -p|--threshold)
@@ -357,6 +392,7 @@ parse_args() {
                 ;;
             -n|--max-runs)
                 MAX_RUNS="${2:?'--max-runs requires a value'}"
+                require_int "--max-runs" "$MAX_RUNS" 0
                 shift 2
                 ;;
             --once)
@@ -369,10 +405,12 @@ parse_args() {
                 ;;
             --retries)
                 RETRIES="${2:?'--retries requires a value'}"
+                require_int "--retries" "$RETRIES" 1
                 shift 2
                 ;;
             --retry-delay)
                 RETRY_DELAY="${2:?'--retry-delay requires a value'}"
+                require_int "--retry-delay" "$RETRY_DELAY" 0
                 shift 2
                 ;;
             -m|--mode)
@@ -552,9 +590,11 @@ fetch_url() {
         # Parse response using our custom delimiters
         local http_code content_type response
 
-        http_code=$(echo "$raw_output" | grep "^${RESPONSE_DELIM}HTTP_CODE:" | sed "s/^${RESPONSE_DELIM}HTTP_CODE://")
-        content_type=$(echo "$raw_output" | grep "^${RESPONSE_DELIM}CONTENT_TYPE:" | sed "s/^${RESPONSE_DELIM}CONTENT_TYPE://")
-        response=$(echo "$raw_output" | grep -v "^${RESPONSE_DELIM}")
+        # grep -a: a body with bytes that are not valid in the current locale
+        # would otherwise be reported as "Binary file" instead of passed through.
+        http_code=$(printf '%s\n' "$raw_output" | grep -a "^${RESPONSE_DELIM}HTTP_CODE:" | sed "s/^${RESPONSE_DELIM}HTTP_CODE://")
+        content_type=$(printf '%s\n' "$raw_output" | grep -a "^${RESPONSE_DELIM}CONTENT_TYPE:" | sed "s/^${RESPONSE_DELIM}CONTENT_TYPE://")
+        response=$(printf '%s\n' "$raw_output" | grep -av "^${RESPONSE_DELIM}")
 
         # Check HTTP status
         if [[ "$http_code" =~ ^[45] ]]; then
@@ -599,15 +639,69 @@ detect_mode() {
     fi
 }
 
+# Decode the HTML entities that commonly appear in page text (byte-oriented,
+# so it is safe on any input encoding). Shared by both strippers below.
+decode_html_entities() {
+    sed 's/&nbsp;/ /g; s/&lt;/</g; s/&gt;/>/g; s/&quot;/"/g; s/&#39;/'"'"'/g; s/&#x27;/'"'"'/g; s/&apos;/'"'"'/g;
+         s/&euro;/€/g; s/&copy;/©/g; s/&reg;/®/g; s/&amp;/\&/g'
+}
+
+# Perl stripper: one slurp pass, so comments, <script>/<style> blocks and
+# tags spanning several lines are removed whatever they contain. Numeric
+# entities (&#NNN; / &#xHH;) are decoded to UTF-8.
+strip_html_tags_perl() {
+    perl -0777 -MEncode -pe '
+        s/<!--.*?-->/ /gs;
+        s/<script\b[^>]*>.*?<\/script\s*>/ /gis;
+        s/<style\b[^>]*>.*?<\/style\s*>/ /gis;
+        # Tags, quote-aware: a ">" inside a quoted attribute value does not
+        # end the tag, so the rest of the attribute cannot leak into the text.
+        s/<[a-zA-Z!\/?][^>"'"'"']*(?:(?:"[^"]*"|'"'"'[^'"'"']*'"'"')[^>"'"'"']*)*>/ /gs;
+        # Anything left that still looks like a tag (unbalanced quotes).
+        s/<[a-zA-Z!\/?][^>]*>/ /gs;
+        s/&#x([0-9a-fA-F]+);/Encode::encode_utf8(chr(hex($1)))/ge;
+        s/&#([0-9]+);/Encode::encode_utf8(chr($1))/ge;
+    ' | decode_html_entities
+}
+
+# sed/awk fallback: join the document on one line, then put every tag on its
+# own line so line-range deletes can drop comments and script/style blocks
+# even when their content contains "<". Named entities only.
+strip_html_tags_sed() {
+    tr '\n' ' ' |
+    awk '{ gsub(/</, "\n<"); gsub(/>/, ">\n"); print }' |
+    sed -e '/^<!--.*-->$/d' \
+        -e '/^<!--/,/-->$/d' \
+        -e '/^<[Ss][Cc][Rr][Ii][Pp][Tt]/,/^<\/[Ss][Cc][Rr][Ii][Pp][Tt]/d' \
+        -e '/^<[Ss][Tt][Yy][Ll][Ee]/,/^<\/[Ss][Tt][Yy][Ll][Ee]/d' \
+        -e '/^<[^>]*>$/d' |
+    decode_html_entities
+}
+
 strip_html_tags() {
-    # Remove script/style blocks, then HTML tags, then normalize whitespace
-    # Use character classes [Ss] for portability (BSD sed has no case-insensitive flag)
-    sed -E 's/<[Ss][Cc][Rr][Ii][Pp][Tt][^>]*>[^<]*<\/[Ss][Cc][Rr][Ii][Pp][Tt]>//g' |
-    sed -E 's/<[Ss][Tt][Yy][Ll][Ee][^>]*>[^<]*<\/[Ss][Tt][Yy][Ll][Ee]>//g' |
-    sed -E 's/<[^>]+>//g' |
-    sed 's/&nbsp;/ /g; s/&amp;/\&/g; s/&lt;/</g; s/&gt;/>/g; s/&quot;/"/g' |
-    tr -s '[:space:]' '\n' |
-    sed '/^$/d'
+    # Remove comments, script/style blocks and tags, decode entities, then
+    # normalize whitespace (one word per line). WW_HTML_STRIPPER=perl|sed
+    # forces an implementation; by default perl is used when available.
+    local stripper="${WW_HTML_STRIPPER:-}"
+    if [ -z "$stripper" ]; then
+        if command -v perl &>/dev/null; then stripper="perl"; else stripper="sed"; fi
+    fi
+    log_verbose "HTML stripper: $stripper"
+
+    # LC_ALL=C gives sed/tr/awk byte semantics. Under a UTF-8 locale they
+    # abort with "illegal byte sequence" on a page whose bytes are not valid
+    # UTF-8 (a Latin-1 page, say), which used to empty the extracted text.
+    # Every pattern here is ASCII, so UTF-8 sequences pass through untouched.
+    (
+        export LC_ALL=C
+        if [ "$stripper" = perl ]; then
+            strip_html_tags_perl
+        else
+            strip_html_tags_sed
+        fi |
+        tr -s '[:space:]' '\n' |
+        sed '/^$/d'
+    )
 }
 
 process_content() {
@@ -615,11 +709,13 @@ process_content() {
     local resolved_mode="$2"
 
     # Apply jq filter for JSON
+    # printf rather than echo throughout: a response consisting of "-n" or
+    # "-e" would otherwise be swallowed as an echo option.
     if [ -n "$JQ_FILTER" ]; then
         local filtered
-        filtered=$(echo "$content" | jq -r "$JQ_FILTER" 2>/dev/null) || {
+        filtered=$(printf '%s\n' "$content" | jq -r "$JQ_FILTER" 2>/dev/null) || {
             log_warn "jq filter failed, using raw content"
-            echo "$content"
+            printf '%s\n' "$content"
             return
         }
         content="$filtered"
@@ -628,9 +724,9 @@ process_content() {
     # Apply grep selector
     if [ -n "$SELECTOR" ]; then
         local selected
-        selected=$(echo "$content" | grep -i "$SELECTOR" 2>/dev/null) || {
+        selected=$(printf '%s\n' "$content" | grep -ai "$SELECTOR" 2>/dev/null) || {
             log_warn "Selector pattern not found, using full content"
-            echo "$content"
+            printf '%s\n' "$content"
             return
         }
         content="$selected"
@@ -638,10 +734,10 @@ process_content() {
 
     # Strip HTML if website mode or forced
     if [ "$resolved_mode" = "website" ] || [ "$STRIP_HTML" = true ]; then
-        content=$(echo "$content" | strip_html_tags)
+        content=$(printf '%s\n' "$content" | strip_html_tags)
     fi
 
-    echo "$content"
+    printf '%s\n' "$content"
 }
 
 # --- Change Detection ---
@@ -665,8 +761,8 @@ calculate_change_percent() {
 
     # Use diff to count changed lines
     local old_lines new_lines changed_lines
-    old_lines=$(echo "$old" | wc -l | tr -d ' ')
-    new_lines=$(echo "$new" | wc -l | tr -d ' ')
+    old_lines=$(printf '%s\n' "$old" | wc -l | tr -d ' ')
+    new_lines=$(printf '%s\n' "$new" | wc -l | tr -d ' ')
 
     if [ "$old_lines" -eq 0 ]; then
         old_lines=1
@@ -674,8 +770,8 @@ calculate_change_percent() {
 
     # Count differing lines (each side separately to avoid double-counting)
     local removed_count added_count
-    removed_count=$(diff <(echo "$old") <(echo "$new") 2>/dev/null | grep -c '^<' || true)
-    added_count=$(diff <(echo "$old") <(echo "$new") 2>/dev/null | grep -c '^>' || true)
+    removed_count=$(diff -a <(printf '%s\n' "$old") <(printf '%s\n' "$new") 2>/dev/null | grep -ac '^<' || true)
+    added_count=$(diff -a <(printf '%s\n' "$old") <(printf '%s\n' "$new") 2>/dev/null | grep -ac '^>' || true)
     if [ "$removed_count" -gt "$added_count" ]; then
         changed_lines="$removed_count"
     else
@@ -693,8 +789,21 @@ calculate_change_percent() {
         total_lines=1
     fi
 
-    # Use awk for floating point
-    awk "BEGIN { printf \"%.2f\", ($changed_lines / $total_lines) * 100 }"
+    # Use awk for floating point. LC_ALL=C forces a decimal point: under a
+    # locale with a decimal comma (fr_FR, de_DE, ...) awk would print "9,09",
+    # which then breaks every numeric comparison made on the result.
+    LC_ALL=C awk -v c="$changed_lines" -v t="$total_lines" 'BEGIN { printf "%.2f", (c / t) * 100 }'
+}
+
+# 0 (true) if change percentage $1 reaches threshold $2.
+# Anything that is not a number is treated as a change: never swallow one.
+exceeds_threshold() {
+    local pct="$1" threshold="$2"
+    if ! [[ "$pct" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+        log_warn "Unexpected change percentage '$pct', treating as a change"
+        return 0
+    fi
+    [ "$(LC_ALL=C awk -v p="$pct" -v t="$threshold" 'BEGIN { print (p >= t) ? 1 : 0 }')" = "1" ]
 }
 
 show_diff() {
@@ -704,7 +813,7 @@ show_diff() {
     if [ "$HAS_DIFF" = true ]; then
         echo -e "${DIM}--- previous${NC}"
         echo -e "${DIM}+++ current${NC}"
-        diff <(echo "$old") <(echo "$new") 2>/dev/null | tail -n +3 || true
+        diff -a <(printf '%s\n' "$old") <(printf '%s\n' "$new") 2>/dev/null | tail -n +3 || true
     else
         echo -e "${YELLOW}(diff not available — install diffutils)${NC}"
     fi
@@ -726,7 +835,7 @@ save_snapshot() {
     timestamp=$(date '+%Y%m%d_%H%M%S')
     local filename="${SNAPSHOT_DIR}/snapshot_${timestamp}_${label}.txt"
 
-    echo "$content" > "$filename"
+    printf '%s\n' "$content" > "$filename"
     log_verbose "Snapshot saved: $filename"
 }
 
@@ -775,8 +884,11 @@ print_watch_config() {
     [ -n "$DISCORD_WEBHOOK" ] && channels+=("Discord")
     [ -n "$TELEGRAM_TOKEN" ] && [ -n "$TELEGRAM_CHAT_ID" ] && channels+=("Telegram")
     if [ ${#channels[@]} -gt 0 ]; then
-        local IFS=', '
-        echo -e "  ${CYAN}Notify:${NC}     ${channels[*]}"
+        local joined="" c
+        for c in "${channels[@]}"; do
+            joined="${joined:+$joined, }$c"
+        done
+        echo -e "  ${CYAN}Notify:${NC}     $joined"
     fi
     echo ""
 }
@@ -804,6 +916,26 @@ cleanup() {
 }
 
 # --- Main Watch Loop ---
+
+# persist_baseline <content> — write the current baseline to --baseline-file
+persist_baseline() {
+    if [ -n "$BASELINE_FILE" ]; then
+        printf '%s\n' "$1" > "$BASELINE_FILE"
+        log_verbose "Baseline saved to $BASELINE_FILE"
+    fi
+}
+
+# check_max_runs <run_count> <change_count> — exit 0 once --max-runs is reached
+check_max_runs() {
+    local run_count="$1" change_count="$2"
+    if [ "$MAX_RUNS" -gt 0 ] && [ "$run_count" -ge "$MAX_RUNS" ]; then
+        echo ""
+        log_info "Reached max runs ($MAX_RUNS). Stopping."
+        log_info "Total changes detected: $change_count"
+        log_to_file "STOP — Reached $MAX_RUNS runs, $change_count changes detected"
+        exit 0
+    fi
+}
 
 main() {
     setup_colors
@@ -840,6 +972,7 @@ main() {
             if [ "$ONCE" = true ]; then
                 exit 1
             fi
+            check_max_runs "$run_count" "$change_count"
             print_countdown "$INTERVAL"
             continue
         fi
@@ -867,12 +1000,7 @@ main() {
                 save_snapshot "$current_content" "initial"
                 log_success "Baseline captured (HTTP $LAST_HTTP_CODE, ${#current_content} bytes, mode: $resolved_mode)"
                 log_to_file "BASELINE — HTTP $LAST_HTTP_CODE, ${#current_content} bytes"
-
-                # Save baseline to file for future --once runs
-                if [ -n "$BASELINE_FILE" ]; then
-                    echo "$current_content" > "$BASELINE_FILE"
-                    log_verbose "Baseline saved to $BASELINE_FILE"
-                fi
+                persist_baseline "$current_content"
 
                 if [ "$ONCE" = true ]; then
                     log_info "Baseline saved. Next --once run will compare against it."
@@ -901,10 +1029,7 @@ main() {
             log_verbose "Change detected: ${change_pct}% (threshold: ${THRESHOLD}%)"
 
             # Check threshold
-            local exceeds_threshold
-            exceeds_threshold=$(awk "BEGIN { print ($change_pct >= $THRESHOLD) ? 1 : 0 }")
-
-            if [ "$exceeds_threshold" -eq 1 ]; then
+            if exceeds_threshold "$change_pct" "$THRESHOLD"; then
                 change_count=$((change_count + 1))
 
                 send_notification "Web Watcher — Change Detected" \
@@ -922,29 +1047,21 @@ main() {
 
                 # Update baseline to current
                 previous_content="$current_content"
+                persist_baseline "$current_content"
             else
                 local ts
                 ts=$(date '+%H:%M:%S')
-                [ "$QUIET" = false ] && printf "  ${DIM}[%s] Check #%d — Minor change (%.2f%% < %s%% threshold)${NC}\n" \
+                [ "$QUIET" = false ] && printf "  ${DIM}[%s] Check #%d — Minor change (%s%% < %s%% threshold)${NC}\n" \
                     "$ts" "$run_count" "$change_pct" "$THRESHOLD"
             fi
         fi
 
-        # Check max runs
-        if [ "$MAX_RUNS" -gt 0 ] && [ "$run_count" -ge "$MAX_RUNS" ]; then
-            echo ""
-            log_info "Reached max runs ($MAX_RUNS). Stopping."
-            log_info "Total changes detected: $change_count"
-            log_to_file "STOP — Reached $MAX_RUNS runs, $change_count changes detected"
-            exit 0
-        fi
+        check_max_runs "$run_count" "$change_count"
 
         # Single run mode
         if [ "$ONCE" = true ]; then
-            # Update baseline file with latest content
-            if [ -n "$BASELINE_FILE" ]; then
-                echo "$current_content" > "$BASELINE_FILE"
-            fi
+            # A minor change (below threshold) still becomes the new baseline
+            persist_baseline "$current_content"
             if [ "$change_count" -gt 0 ]; then
                 exit 2  # Exit code 2 = change detected
             fi
