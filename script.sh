@@ -609,13 +609,55 @@ detect_mode() {
     fi
 }
 
+# Decode the HTML entities that commonly appear in page text (byte-oriented,
+# so it is safe on any input encoding). Shared by both strippers below.
+decode_html_entities() {
+    sed 's/&nbsp;/ /g; s/&lt;/</g; s/&gt;/>/g; s/&quot;/"/g; s/&#39;/'"'"'/g; s/&#x27;/'"'"'/g; s/&apos;/'"'"'/g;
+         s/&euro;/€/g; s/&copy;/©/g; s/&reg;/®/g; s/&amp;/\&/g'
+}
+
+# Perl stripper: one slurp pass, so comments, <script>/<style> blocks and
+# tags spanning several lines are removed whatever they contain. Numeric
+# entities (&#NNN; / &#xHH;) are decoded to UTF-8.
+strip_html_tags_perl() {
+    perl -0777 -MEncode -pe '
+        s/<!--.*?-->/ /gs;
+        s/<script\b[^>]*>.*?<\/script\s*>/ /gis;
+        s/<style\b[^>]*>.*?<\/style\s*>/ /gis;
+        s/<[^>]*>/ /gs;
+        s/&#x([0-9a-fA-F]+);/Encode::encode_utf8(chr(hex($1)))/ge;
+        s/&#([0-9]+);/Encode::encode_utf8(chr($1))/ge;
+    ' | decode_html_entities
+}
+
+# sed/awk fallback: join the document on one line, then put every tag on its
+# own line so line-range deletes can drop comments and script/style blocks
+# even when their content contains "<". Named entities only.
+strip_html_tags_sed() {
+    tr '\n' ' ' |
+    awk '{ gsub(/</, "\n<"); gsub(/>/, ">\n"); print }' |
+    sed -e '/^<!--.*-->$/d' \
+        -e '/^<!--/,/-->$/d' \
+        -e '/^<[Ss][Cc][Rr][Ii][Pp][Tt]/,/^<\/[Ss][Cc][Rr][Ii][Pp][Tt]/d' \
+        -e '/^<[Ss][Tt][Yy][Ll][Ee]/,/^<\/[Ss][Tt][Yy][Ll][Ee]/d' \
+        -e '/^<[^>]*>$/d' |
+    decode_html_entities
+}
+
 strip_html_tags() {
-    # Remove script/style blocks, then HTML tags, then normalize whitespace
-    # Use character classes [Ss] for portability (BSD sed has no case-insensitive flag)
-    sed -E 's/<[Ss][Cc][Rr][Ii][Pp][Tt][^>]*>[^<]*<\/[Ss][Cc][Rr][Ii][Pp][Tt]>//g' |
-    sed -E 's/<[Ss][Tt][Yy][Ll][Ee][^>]*>[^<]*<\/[Ss][Tt][Yy][Ll][Ee]>//g' |
-    sed -E 's/<[^>]+>//g' |
-    sed 's/&nbsp;/ /g; s/&amp;/\&/g; s/&lt;/</g; s/&gt;/>/g; s/&quot;/"/g' |
+    # Remove comments, script/style blocks and tags, decode entities, then
+    # normalize whitespace (one word per line). WW_HTML_STRIPPER=perl|sed
+    # forces an implementation; by default perl is used when available.
+    local stripper="${WW_HTML_STRIPPER:-}"
+    if [ -z "$stripper" ]; then
+        if command -v perl &>/dev/null; then stripper="perl"; else stripper="sed"; fi
+    fi
+    log_verbose "HTML stripper: $stripper"
+    if [ "$stripper" = perl ]; then
+        strip_html_tags_perl
+    else
+        strip_html_tags_sed
+    fi |
     tr -s '[:space:]' '\n' |
     sed '/^$/d'
 }

@@ -321,6 +321,47 @@ t_non_integer_options_rejected() {
     assert_contains "$OUT" "--retry-delay must be an integer >= 0"
 }
 
+# Assertions shared by the HTML stripper tests: $1 is the extracted text.
+check_stripped_page() {
+    assert_contains "$1" "Hello"
+    assert_contains "$1" "Product"
+    assert_contains "$1" "€"
+    assert_contains "$1" "'quoted'"
+    assert_not_contains "$1" "<"
+    assert_not_contains "$1" "var"
+    assert_not_contains "$1" "Date.now"
+    assert_not_contains "$1" "nonce"
+    assert_not_contains "$1" "href"
+    assert_not_contains "$1" "color:"
+    assert_not_contains "$1" "comment"
+    assert_not_contains "$1" "&euro;"
+    assert_not_contains "$1" "&#x27;"
+}
+
+t_website_mode_strips_scripts_styles_and_tags() {
+    ww --once -m website --baseline-file "$TMP/baseline" "$BASE/page.html"
+    assert_rc 0
+    local text
+    text=$(cat "$TMP/baseline")
+    check_stripped_page "$text"
+    assert_contains "$text" "©"          # numeric entity &#169;
+    assert_not_contains "$text" "&#"
+}
+
+t_website_mode_sed_fallback_strips_scripts_styles_and_tags() {
+    WW_HTML_STRIPPER="sed" ww --once -m website --baseline-file "$TMP/baseline" "$BASE/page.html"
+    assert_rc 0
+    check_stripped_page "$(cat "$TMP/baseline")"
+}
+
+t_website_mode_ignores_script_only_changes() {
+    ww --once -m website --baseline-file "$TMP/baseline" "$BASE/page.html"
+    sed 's/abc123/zzz999/' "$FIXTURES/page.html" > "$SERVE/page.html"
+    ww --once -m website --baseline-file "$TMP/baseline" "$BASE/page.html"
+    assert_rc 0
+    assert_contains "$OUT" "No change"
+}
+
 t_retry_delay_zero_accepted() {
     ww --once --retry-delay 0 "$BASE/a.json"
     assert_rc 0
