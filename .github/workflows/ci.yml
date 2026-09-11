@@ -17,7 +17,7 @@ jobs:
         run: sudo apt-get install -y shellcheck
 
       - name: Run ShellCheck
-        run: shellcheck -s bash -S warning script.sh
+        run: shellcheck -s bash -S warning script.sh tests/run.sh
 
   syntax:
     name: Bash Syntax Check
@@ -26,7 +26,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Check syntax
-        run: bash -n script.sh
+        run: bash -n script.sh tests/run.sh
 
   test:
     name: Functional Tests (${{ matrix.os }})
@@ -45,53 +45,5 @@ jobs:
             brew install jq
           fi
 
-      - name: Make script executable
-        run: chmod +x script.sh
-
-      - name: Test --help flag
-        run: |
-          ./script.sh --help | grep -q "Usage:" || { echo "FAIL: help missing Usage"; exit 1; }
-          ./script.sh --help | grep -q "\-\-once" || { echo "FAIL: help missing --once"; exit 1; }
-          ./script.sh --help | grep -q "\-\-baseline-file" || { echo "FAIL: help missing --baseline-file"; exit 1; }
-
-      - name: Test missing URL error
-        run: |
-          ./script.sh 2>&1 && { echo "FAIL: should have exited non-zero"; exit 1; } || true
-
-      - name: Test invalid URL scheme error
-        run: |
-          ./script.sh ftp://example.com 2>&1 | grep -q "must start with http" || { echo "FAIL: should reject non-http URL"; exit 1; }
-
-      - name: Test unknown option error
-        run: |
-          ./script.sh --bogus 2>&1 | grep -q "Unknown option" || { echo "FAIL: should report unknown option"; exit 1; }
-
-      - name: Test --once baseline capture (live API)
-        run: |
-          ./script.sh --once --no-color --no-sound https://httpbin.org/get 2>&1 | grep -q "Baseline" || { echo "FAIL: --once should capture baseline"; exit 1; }
-
-      - name: Test --once with --baseline-file persistence
-        run: |
-          # First run: capture baseline
-          ./script.sh --once --baseline-file /tmp/ww_test_baseline.txt --no-color --no-sound https://httpbin.org/uuid 2>&1
-          [[ -f /tmp/ww_test_baseline.txt ]] || { echo "FAIL: baseline file not created"; exit 1; }
-          echo "Baseline file created OK"
-
-          # Second run: compare (uuid changes every time → should detect change)
-          rc=0
-          ./script.sh --once --baseline-file /tmp/ww_test_baseline.txt --no-color --no-sound https://httpbin.org/uuid 2>&1 || rc=$?
-          echo "Exit code: $rc"
-          [[ "$rc" -eq 2 ]] || { echo "FAIL: expected exit code 2 (change detected), got $rc"; exit 1; }
-          echo "Change detection OK"
-
-      - name: Test --once with jq filter
-        run: |
-          ./script.sh --once -f '.origin' --no-color --no-sound https://httpbin.org/get 2>&1 | grep -q "Baseline" || { echo "FAIL: jq filter should work"; exit 1; }
-
-      - name: Test invalid interval
-        run: |
-          ./script.sh -i 0 https://example.com 2>&1 | grep -q "positive integer" || { echo "FAIL: should reject interval 0"; exit 1; }
-
-      - name: Test invalid mode
-        run: |
-          ./script.sh -m invalid https://example.com 2>&1 | grep -q "must be one of" || { echo "FAIL: should reject invalid mode"; exit 1; }
+      - name: Run test suite
+        run: bash tests/run.sh
