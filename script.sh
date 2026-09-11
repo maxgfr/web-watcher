@@ -118,7 +118,7 @@ send_notification() {
 
     # OS-level notification
     if [[ "$OSTYPE" == "darwin"* ]]; then
-        osascript -e "display notification \"$message\" with title \"$title\" sound name \"Glass\"" 2>/dev/null || true
+        osascript -e "display notification \"$(applescript_escape "$message")\" with title \"$(applescript_escape "$title")\" sound name \"Glass\"" 2>/dev/null || true
     elif command -v notify-send &>/dev/null; then
         notify-send "$title" "$message" 2>/dev/null || true
     fi
@@ -141,27 +141,55 @@ send_notification() {
 
 # --- Webhook Notifications ---
 
+# Escape a string for use inside a double-quoted AppleScript literal.
+applescript_escape() {
+    local s="$1"
+    s=${s//\\/\\\\}
+    s=${s//\"/\\\"}
+    printf '%s' "$s"
+}
+
+# Print $1 as a JSON string literal (quotes included).
+json_escape() {
+    local s="$1"
+    s=${s//\\/\\\\}
+    s=${s//\"/\\\"}
+    s=${s//$'\n'/\\n}
+    s=${s//$'\r'/\\r}
+    s=${s//$'\t'/\\t}
+    printf '"%s"' "$s"
+}
+
+# POST a JSON document to a webhook. -f makes HTTP 4xx/5xx a failure so the
+# caller can report it instead of silently losing the notification.
+post_json() {
+    local url="$1" payload="$2"
+    curl -fs -X POST -H 'Content-Type: application/json' --max-time "$TIMEOUT" \
+        -d "$payload" -- "$url" >/dev/null 2>&1
+}
+
 send_slack() {
-    local title="$1" message="$2"
-    curl -s -X POST -H 'Content-Type: application/json' \
-        -d "{\"text\":\"*${title}*\n${message}\n${URL}\"}" \
-        "$SLACK_WEBHOOK" >/dev/null 2>&1 || log_warn "Slack notification failed"
+    local title="$1" message="$2" text
+    text=$(json_escape "*${title}*"$'\n'"${message}"$'\n'"${URL}")
+    post_json "$SLACK_WEBHOOK" "{\"text\":${text}}" || log_warn "Slack notification failed"
 }
 
 send_discord() {
-    local title="$1" message="$2"
-    curl -s -X POST -H 'Content-Type: application/json' \
-        -d "{\"content\":\"**${title}**\n${message}\n${URL}\"}" \
-        "$DISCORD_WEBHOOK" >/dev/null 2>&1 || log_warn "Discord notification failed"
+    local title="$1" message="$2" text
+    text=$(json_escape "**${title}**"$'\n'"${message}"$'\n'"${URL}")
+    post_json "$DISCORD_WEBHOOK" "{\"content\":${text}}" || log_warn "Discord notification failed"
 }
 
 send_telegram() {
     local title="$1" message="$2"
-    curl -s -X POST \
-        "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage" \
-        -d "chat_id=${TELEGRAM_CHAT_ID}&text=${title}
-${message}
-${URL}&parse_mode=Markdown" >/dev/null 2>&1 || log_warn "Telegram notification failed"
+    local api="${WW_TELEGRAM_API:-https://api.telegram.org}"
+    # Fields are url-encoded (a "&" in the URL would otherwise start a new
+    # parameter) and sent as plain text: no parse_mode, so "_" and "*" in URLs
+    # need no escaping.
+    curl -fs -X POST --max-time "$TIMEOUT" \
+        --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+        --data-urlencode "text=${title}"$'\n'"${message}"$'\n'"${URL}" \
+        -- "${api}/bot${TELEGRAM_TOKEN}/sendMessage" >/dev/null 2>&1 || log_warn "Telegram notification failed"
 }
 
 # --- Banner ---

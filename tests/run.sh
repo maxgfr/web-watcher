@@ -362,6 +362,66 @@ t_website_mode_ignores_script_only_changes() {
     assert_contains "$OUT" "No change"
 }
 
+# Run a --once baseline then a changed --once with the given extra options,
+# so a notification is sent on the second run.
+trigger_change() {
+    ww --once --baseline-file "$TMP/baseline" "$@"
+    sed 's/"price": 10/"price": 12/' "$FIXTURES/a.json" > "$SERVE/a.json"
+    ww --once --baseline-file "$TMP/baseline" "$@"
+}
+
+t_slack_webhook_sends_valid_json() {
+    # A URL with quotes and a backslash must not break the JSON payload.
+    trigger_change --slack "$BASE/hook/slack" "$BASE/a.json?q=\"x\"\\y"
+    assert_rc 2
+    assert_eq "$(hook_count)" "1"
+    assert_contains "$(last_hook path)" "/hook/slack"
+    assert_contains "$(last_hook content_type)" "application/json"
+    if last_hook_body_is_json; then pass; else fail "Slack body is not valid JSON: $(last_hook body)"; fi
+    assert_contains "$(last_hook body)" "Change Detected"
+    assert_contains "$(last_hook body)" "a.json?q="
+    assert_not_contains "$OUT" "[WARN]"
+}
+
+t_discord_webhook_sends_valid_json() {
+    trigger_change --discord "$BASE/hook/discord" "$BASE/a.json?q=\"x\"\\y"
+    assert_rc 2
+    assert_eq "$(hook_count)" "1"
+    assert_contains "$(last_hook path)" "/hook/discord"
+    if last_hook_body_is_json; then pass; else fail "Discord body is not valid JSON: $(last_hook body)"; fi
+    assert_contains "$(last_hook body)" "Change Detected"
+    assert_not_contains "$OUT" "[WARN]"
+}
+
+t_webhook_http_error_is_reported() {
+    trigger_change --slack "$BASE/hook/fail-slack" --discord "$BASE/hook/fail-discord" "$BASE/a.json"
+    assert_rc 2
+    assert_eq "$(hook_count)" "2"
+    assert_contains "$OUT" "[WARN] Slack notification failed"
+    assert_contains "$OUT" "[WARN] Discord notification failed"
+}
+
+t_telegram_sends_full_message_urlencoded() {
+    # "&" in the URL must stay inside the text field, "_" must not need escaping.
+    WW_TELEGRAM_API="$BASE" trigger_change --telegram-token "123:abc" --telegram-chat "42" \
+        "$BASE/a.json?x=1&y=my_value"
+    assert_rc 2
+    assert_eq "$(hook_count)" "1"
+    assert_contains "$(last_hook path)" "/bot123:abc/sendMessage"
+    local text
+    text=$(python3 -c 'import sys,urllib.parse; q=urllib.parse.parse_qs(sys.stdin.read()); print(q["chat_id"][0]); print(q["text"][0])' <<< "$(last_hook body)")
+    assert_contains "$text" "42"
+    assert_contains "$text" "Change Detected"
+    assert_contains "$text" "a.json?x=1&y=my_value"
+    assert_not_contains "$OUT" "[WARN]"
+}
+
+t_telegram_http_error_is_reported() {
+    WW_TELEGRAM_API="$BASE" trigger_change --telegram-token "fail" --telegram-chat "42" "$BASE/a.json"
+    assert_rc 2
+    assert_contains "$OUT" "[WARN] Telegram notification failed"
+}
+
 t_retry_delay_zero_accepted() {
     ww --once --retry-delay 0 "$BASE/a.json"
     assert_rc 0
