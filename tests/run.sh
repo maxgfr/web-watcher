@@ -373,6 +373,19 @@ t_website_mode_strips_scripts_styles_and_tags() {
     assert_not_contains "$text" "&#"
 }
 
+t_website_mode_strips_tags_with_quoted_angle_brackets() {
+    # A ">" inside a quoted attribute value must not end the tag early,
+    # otherwise the rest of the attribute leaks into the compared text.
+    ww --once -m website --baseline-file "$TMP/baseline" "$BASE/page.html"
+    assert_rc 0
+    local text
+    text=$(cat "$TMP/baseline")
+    assert_contains "$text" "Visible"
+    assert_not_contains "$text" "parts"
+    assert_not_contains "$text" "template"
+    assert_not_contains "$text" "meta"
+}
+
 t_website_mode_sed_fallback_strips_scripts_styles_and_tags() {
     WW_HTML_STRIPPER="sed" ww --once -m website --baseline-file "$TMP/baseline" "$BASE/page.html"
     assert_rc 0

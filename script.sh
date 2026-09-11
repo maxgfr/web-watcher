@@ -654,7 +654,11 @@ strip_html_tags_perl() {
         s/<!--.*?-->/ /gs;
         s/<script\b[^>]*>.*?<\/script\s*>/ /gis;
         s/<style\b[^>]*>.*?<\/style\s*>/ /gis;
-        s/<[^>]*>/ /gs;
+        # Tags, quote-aware: a ">" inside a quoted attribute value does not
+        # end the tag, so the rest of the attribute cannot leak into the text.
+        s/<[a-zA-Z!\/?][^>"'"'"']*(?:(?:"[^"]*"|'"'"'[^'"'"']*'"'"')[^>"'"'"']*)*>/ /gs;
+        # Anything left that still looks like a tag (unbalanced quotes).
+        s/<[a-zA-Z!\/?][^>]*>/ /gs;
         s/&#x([0-9a-fA-F]+);/Encode::encode_utf8(chr(hex($1)))/ge;
         s/&#([0-9]+);/Encode::encode_utf8(chr($1))/ge;
     ' | decode_html_entities
