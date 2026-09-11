@@ -53,7 +53,7 @@ sudo ln -s "$(pwd)/script.sh" /usr/local/bin/web-watcher
 
 ### Dependencies
 
-Only `curl` is required. `jq` is needed if you use the `--filter` option.
+Only `curl` is required. `jq` is needed if you use the `--filter` option. In `website` mode, `perl` (present on macOS and nearly every Linux distribution) gives the most accurate HTML-to-text extraction; without it a sed/awk fallback is used. `python3` is only needed to run the test suite.
 
 **macOS:**
 ```bash
@@ -100,7 +100,7 @@ web-watcher [options] <url>
 | `-H, --header <header>` | Custom header (repeatable) | — |
 | `-d, --data <body>` | Request body for POST/PUT | — |
 | `-C, --cookie <cookie>` | Cookie string or file path | — |
-| `-A, --user-agent <ua>` | Custom User-Agent | `web-watcher/1.0.0` |
+| `-A, --user-agent <ua>` | Custom User-Agent | `web-watcher/<version>` |
 | `--auth <user:pass>` | Basic auth credentials | — |
 | `--timeout <secs>` | Request timeout | `15` |
 | `--no-follow` | Don't follow redirects | follows |
@@ -135,6 +135,15 @@ web-watcher [options] <url>
 | `--discord <url>` | Discord webhook URL | — |
 | `--telegram-token <token>` | Telegram bot token | — |
 | `--telegram-chat <chat_id>` | Telegram chat ID | — |
+
+Webhook calls fail loudly: an HTTP error from Slack, Discord or Telegram is reported with a `[WARN]` line instead of being ignored. Messages are sent as plain text, so URLs containing `_`, `*` or `&` are delivered unchanged.
+
+### Environment Variables
+
+| Variable | Description | Default |
+|---|---|---|
+| `WW_TELEGRAM_API` | Base URL of the Telegram Bot API (useful for proxies or tests) | `https://api.telegram.org` |
+| `WW_HTML_STRIPPER` | Force the HTML-to-text implementation: `perl` or `sed` | `perl` if available, else `sed` |
 
 ### Output Options
 
@@ -320,6 +329,16 @@ Exit codes for `--once` mode:
 - **Use `--threshold`** to avoid false positives on dynamic sites (ads, timestamps, etc.)
 - **Use `--snapshot-dir`** to build a history of responses you can analyze later
 - **JSON API?** Always use `-f` to target the fields you care about — avoids noise from metadata changes
+
+## Tests
+
+The test suite needs `python3` (it serves fixtures from a local HTTP server, no network access required) and runs every test under `bash` from your PATH plus `/bin/bash`, and under the `C` locale plus `fr_FR.UTF-8` when it is installed (to catch decimal-comma formatting bugs):
+
+```bash
+bash tests/run.sh              # whole suite
+bash tests/run.sh t_help_shows_usage t_once_captures_baseline   # a subset
+WW_TEST_SHELLS=bash WW_TEST_LOCALES=C bash tests/run.sh          # single shell / locale
+```
 
 ## License
 
