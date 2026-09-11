@@ -422,6 +422,19 @@ t_telegram_http_error_is_reported() {
     assert_contains "$OUT" "[WARN] Telegram notification failed"
 }
 
+t_non_utf8_content_is_kept() {
+    # Invalid UTF-8 bytes must not make grep treat the response as binary.
+    printf 'abc\377\376def\nghi\n' > "$SERVE/bin.dat"
+    ww --once --baseline-file "$TMP/baseline" "$BASE/bin.dat"
+    assert_rc 0
+    local text
+    text=$(cat "$TMP/baseline")
+    assert_contains "$text" "abc"
+    assert_contains "$text" "def"
+    assert_contains "$text" "ghi"
+    assert_not_contains "$text" "Binary file"
+}
+
 t_retry_delay_zero_accepted() {
     ww --once --retry-delay 0 "$BASE/a.json"
     assert_rc 0

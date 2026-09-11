@@ -590,9 +590,11 @@ fetch_url() {
         # Parse response using our custom delimiters
         local http_code content_type response
 
-        http_code=$(echo "$raw_output" | grep "^${RESPONSE_DELIM}HTTP_CODE:" | sed "s/^${RESPONSE_DELIM}HTTP_CODE://")
-        content_type=$(echo "$raw_output" | grep "^${RESPONSE_DELIM}CONTENT_TYPE:" | sed "s/^${RESPONSE_DELIM}CONTENT_TYPE://")
-        response=$(echo "$raw_output" | grep -v "^${RESPONSE_DELIM}")
+        # grep -a: a body with bytes that are not valid in the current locale
+        # would otherwise be reported as "Binary file" instead of passed through.
+        http_code=$(printf '%s\n' "$raw_output" | grep -a "^${RESPONSE_DELIM}HTTP_CODE:" | sed "s/^${RESPONSE_DELIM}HTTP_CODE://")
+        content_type=$(printf '%s\n' "$raw_output" | grep -a "^${RESPONSE_DELIM}CONTENT_TYPE:" | sed "s/^${RESPONSE_DELIM}CONTENT_TYPE://")
+        response=$(printf '%s\n' "$raw_output" | grep -av "^${RESPONSE_DELIM}")
 
         # Check HTTP status
         if [[ "$http_code" =~ ^[45] ]]; then
