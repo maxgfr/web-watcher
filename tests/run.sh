@@ -57,7 +57,15 @@ if [ -z "${WW_TEST_SHELLS:-}" ]; then
         WW_TEST_SHELLS="bash /bin/bash"
     fi
 fi
-WW_TEST_LOCALES="${WW_TEST_LOCALES:-C}"
+if [ -z "${WW_TEST_LOCALES:-}" ]; then
+    # A locale with a decimal comma catches number-formatting bugs (awk/printf).
+    WW_TEST_LOCALES="C"
+    if locale -a 2>/dev/null | grep -qi '^fr_FR\.utf-\{0,1\}8$'; then
+        WW_TEST_LOCALES="C fr_FR.UTF-8"
+    else
+        echo "WARN: locale fr_FR.UTF-8 not installed, decimal-comma tests skipped" >&2
+    fi
+fi
 
 # --- Assertions ---------------------------------------------------------------
 
@@ -239,6 +247,41 @@ t_once_no_change_exits_zero() {
     ww --once --baseline-file "$TMP/baseline" "$BASE/a.json"
     assert_rc 0
     assert_contains "$OUT" "No change"
+}
+
+t_change_percent_uses_decimal_point() {
+    ww --once --baseline-file "$TMP/baseline" "$BASE/a.json"
+    sed 's/"price": 10/"price": 12/' "$FIXTURES/a.json" > "$SERVE/a.json"
+    ww --once --baseline-file "$TMP/baseline" "$BASE/a.json"
+    assert_rc 2
+    assert_contains "$OUT" "Change of 9.09% detected"
+}
+
+t_threshold_minor_change_not_notified() {
+    ww --once --baseline-file "$TMP/baseline" "$BASE/a.json"
+    sed 's/"price": 10/"price": 12/' "$FIXTURES/a.json" > "$SERVE/a.json"
+    ww --once -p 50 --baseline-file "$TMP/baseline" "$BASE/a.json"
+    assert_rc 0
+    assert_contains "$OUT" "Minor change (9.09% < 50% threshold)"
+    assert_not_contains "$OUT" "CHANGE DETECTED"
+}
+
+t_threshold_major_change_notified() {
+    ww --once --baseline-file "$TMP/baseline" "$BASE/a.json"
+    printf '{"totally": "different"}\n' > "$SERVE/a.json"
+    ww --once -p 50 --baseline-file "$TMP/baseline" "$BASE/a.json"
+    assert_rc 2
+    assert_contains "$OUT" "CHANGE DETECTED"
+}
+
+t_continuous_mode_survives_a_change() {
+    run_bg -i 1 -n 3 "$BASE/a.json"
+    sleep 1.5
+    sed 's/"price": 10/"price": 12/' "$FIXTURES/a.json" > "$SERVE/a.json"
+    wait_bg 10
+    assert_rc 0
+    assert_contains "$OUT" "CHANGE DETECTED"
+    assert_contains "$OUT" "Reached max runs (3)"
 }
 
 t_max_runs_stops_after_n_checks() {

@@ -693,8 +693,21 @@ calculate_change_percent() {
         total_lines=1
     fi
 
-    # Use awk for floating point
-    awk "BEGIN { printf \"%.2f\", ($changed_lines / $total_lines) * 100 }"
+    # Use awk for floating point. LC_ALL=C forces a decimal point: under a
+    # locale with a decimal comma (fr_FR, de_DE, ...) awk would print "9,09",
+    # which then breaks every numeric comparison made on the result.
+    LC_ALL=C awk -v c="$changed_lines" -v t="$total_lines" 'BEGIN { printf "%.2f", (c / t) * 100 }'
+}
+
+# 0 (true) if change percentage $1 reaches threshold $2.
+# Anything that is not a number is treated as a change: never swallow one.
+exceeds_threshold() {
+    local pct="$1" threshold="$2"
+    if ! [[ "$pct" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+        log_warn "Unexpected change percentage '$pct', treating as a change"
+        return 0
+    fi
+    [ "$(LC_ALL=C awk -v p="$pct" -v t="$threshold" 'BEGIN { print (p >= t) ? 1 : 0 }')" = "1" ]
 }
 
 show_diff() {
@@ -901,10 +914,7 @@ main() {
             log_verbose "Change detected: ${change_pct}% (threshold: ${THRESHOLD}%)"
 
             # Check threshold
-            local exceeds_threshold
-            exceeds_threshold=$(awk "BEGIN { print ($change_pct >= $THRESHOLD) ? 1 : 0 }")
-
-            if [ "$exceeds_threshold" -eq 1 ]; then
+            if exceeds_threshold "$change_pct" "$THRESHOLD"; then
                 change_count=$((change_count + 1))
 
                 send_notification "Web Watcher — Change Detected" \
@@ -925,7 +935,7 @@ main() {
             else
                 local ts
                 ts=$(date '+%H:%M:%S')
-                [ "$QUIET" = false ] && printf "  ${DIM}[%s] Check #%d — Minor change (%.2f%% < %s%% threshold)${NC}\n" \
+                [ "$QUIET" = false ] && printf "  ${DIM}[%s] Check #%d — Minor change (%s%% < %s%% threshold)${NC}\n" \
                     "$ts" "$run_count" "$change_pct" "$THRESHOLD"
             fi
         fi
