@@ -12,8 +12,23 @@ The chosen port is printed on stdout once the server is listening.
 """
 import json
 import os
+import socketserver
 import sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
+
+
+class FastHTTPServer(HTTPServer):
+    """HTTPServer without the reverse-DNS lookup done at bind time.
+
+    HTTPServer.server_bind calls socket.getfqdn(), which blocks for several
+    seconds on hosts with no reverse DNS (CI runners), long enough for the
+    test suite to give up waiting for the port.
+    """
+
+    def server_bind(self):
+        socketserver.TCPServer.server_bind(self)
+        self.server_name = "127.0.0.1"
+        self.server_port = self.server_address[1]
 
 ROOT = sys.argv[1]
 LOGDIR = sys.argv[2]
@@ -66,7 +81,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
-    server = HTTPServer(("127.0.0.1", 0), Handler)
+    server = FastHTTPServer(("127.0.0.1", 0), Handler)
     print(server.server_address[1], flush=True)
     server.serve_forever()
 

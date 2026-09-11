@@ -35,17 +35,42 @@ trap cleanup EXIT
 
 # --- Local server -------------------------------------------------------------
 
-python3 "$ROOT/tests/server.py" "$SERVE" "$HOOKS" > "$TMP/port" 2> "$TMP/server.err" &
-SERVER_PID=$!
-for _ in $(seq 1 50); do
-    [ -s "$TMP/port" ] && break
-    sleep 0.1
-done
-if [ ! -s "$TMP/port" ]; then
-    echo "FATAL: test server did not start" >&2
-    cat "$TMP/server.err" >&2
+PYTHON="${WW_TEST_PYTHON:-}"
+if [ -z "$PYTHON" ]; then
+    for candidate in python3 python; do
+        if command -v "$candidate" > /dev/null 2>&1; then
+            PYTHON="$candidate"
+            break
+        fi
+    done
+fi
+if [ -z "$PYTHON" ]; then
+    echo "FATAL: python3 is required to run the test suite" >&2
     exit 1
 fi
+
+"$PYTHON" "$ROOT/tests/server.py" "$SERVE" "$HOOKS" > "$TMP/port" 2> "$TMP/server.err" &
+SERVER_PID=$!
+
+# Wait for the server to print its port. A cold interpreter on a CI runner can
+# take several seconds, so allow 30s, but give up at once if the process dies.
+waited=0
+while [ ! -s "$TMP/port" ]; do
+    if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+        echo "FATAL: test server exited before printing its port" >&2
+        echo "  interpreter: $PYTHON ($("$PYTHON" --version 2>&1))" >&2
+        sed 's/^/  stderr: /' "$TMP/server.err" >&2
+        exit 1
+    fi
+    if [ "$waited" -ge 300 ]; then
+        echo "FATAL: test server did not print its port within 30s" >&2
+        echo "  interpreter: $PYTHON ($("$PYTHON" --version 2>&1))" >&2
+        sed 's/^/  stderr: /' "$TMP/server.err" >&2
+        exit 1
+    fi
+    sleep 0.1
+    waited=$((waited + 1))
+done
 PORT=$(cat "$TMP/port")
 BASE="http://127.0.0.1:$PORT"
 
