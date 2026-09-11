@@ -435,6 +435,16 @@ t_non_utf8_content_is_kept() {
     assert_not_contains "$text" "Binary file"
 }
 
+t_continuous_mode_updates_baseline_file_on_change() {
+    run_bg -i 1 -n 3 --baseline-file "$TMP/baseline" "$BASE/a.json"
+    wait_for_file "$TMP/baseline" 5 || fail "baseline file not written on first run"
+    sed 's/"price": 10/"price": 12/' "$FIXTURES/a.json" > "$SERVE/a.json"
+    wait_bg 10
+    assert_rc 0
+    assert_contains "$OUT" "CHANGE DETECTED"
+    assert_eq "$(cat "$TMP/baseline")" "$(cat "$SERVE/a.json")"
+}
+
 t_retry_delay_zero_accepted() {
     ww --once --retry-delay 0 "$BASE/a.json"
     assert_rc 0

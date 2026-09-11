@@ -900,6 +900,14 @@ cleanup() {
 
 # --- Main Watch Loop ---
 
+# persist_baseline <content> — write the current baseline to --baseline-file
+persist_baseline() {
+    if [ -n "$BASELINE_FILE" ]; then
+        printf '%s\n' "$1" > "$BASELINE_FILE"
+        log_verbose "Baseline saved to $BASELINE_FILE"
+    fi
+}
+
 # check_max_runs <run_count> <change_count> — exit 0 once --max-runs is reached
 check_max_runs() {
     local run_count="$1" change_count="$2"
@@ -975,12 +983,7 @@ main() {
                 save_snapshot "$current_content" "initial"
                 log_success "Baseline captured (HTTP $LAST_HTTP_CODE, ${#current_content} bytes, mode: $resolved_mode)"
                 log_to_file "BASELINE — HTTP $LAST_HTTP_CODE, ${#current_content} bytes"
-
-                # Save baseline to file for future --once runs
-                if [ -n "$BASELINE_FILE" ]; then
-                    echo "$current_content" > "$BASELINE_FILE"
-                    log_verbose "Baseline saved to $BASELINE_FILE"
-                fi
+                persist_baseline "$current_content"
 
                 if [ "$ONCE" = true ]; then
                     log_info "Baseline saved. Next --once run will compare against it."
@@ -1027,6 +1030,7 @@ main() {
 
                 # Update baseline to current
                 previous_content="$current_content"
+                persist_baseline "$current_content"
             else
                 local ts
                 ts=$(date '+%H:%M:%S')
@@ -1039,10 +1043,8 @@ main() {
 
         # Single run mode
         if [ "$ONCE" = true ]; then
-            # Update baseline file with latest content
-            if [ -n "$BASELINE_FILE" ]; then
-                echo "$current_content" > "$BASELINE_FILE"
-            fi
+            # A minor change (below threshold) still becomes the new baseline
+            persist_baseline "$current_content"
             if [ "$change_count" -gt 0 ]; then
                 exit 2  # Exit code 2 = change detected
             fi
