@@ -445,6 +445,18 @@ t_continuous_mode_updates_baseline_file_on_change() {
     assert_eq "$(cat "$TMP/baseline")" "$(cat "$SERVE/a.json")"
 }
 
+t_notify_channels_listed_with_separator() {
+    ww --once --slack "$BASE/hook/slack" --discord "$BASE/hook/discord" "$BASE/a.json"
+    assert_rc 0
+    assert_contains "$OUT" "Notify:     Slack, Discord"
+}
+
+t_content_looking_like_echo_option_is_kept() {
+    ww --once --baseline-file "$TMP/baseline" "$BASE/dash.txt"
+    assert_rc 0
+    assert_eq "$(cat "$TMP/baseline")" "-n"
+}
+
 t_retry_delay_zero_accepted() {
     ww --once --retry-delay 0 "$BASE/a.json"
     assert_rc 0

@@ -697,11 +697,13 @@ process_content() {
     local resolved_mode="$2"
 
     # Apply jq filter for JSON
+    # printf rather than echo throughout: a response consisting of "-n" or
+    # "-e" would otherwise be swallowed as an echo option.
     if [ -n "$JQ_FILTER" ]; then
         local filtered
-        filtered=$(echo "$content" | jq -r "$JQ_FILTER" 2>/dev/null) || {
+        filtered=$(printf '%s\n' "$content" | jq -r "$JQ_FILTER" 2>/dev/null) || {
             log_warn "jq filter failed, using raw content"
-            echo "$content"
+            printf '%s\n' "$content"
             return
         }
         content="$filtered"
@@ -710,9 +712,9 @@ process_content() {
     # Apply grep selector
     if [ -n "$SELECTOR" ]; then
         local selected
-        selected=$(echo "$content" | grep -i "$SELECTOR" 2>/dev/null) || {
+        selected=$(printf '%s\n' "$content" | grep -ai "$SELECTOR" 2>/dev/null) || {
             log_warn "Selector pattern not found, using full content"
-            echo "$content"
+            printf '%s\n' "$content"
             return
         }
         content="$selected"
@@ -720,10 +722,10 @@ process_content() {
 
     # Strip HTML if website mode or forced
     if [ "$resolved_mode" = "website" ] || [ "$STRIP_HTML" = true ]; then
-        content=$(echo "$content" | strip_html_tags)
+        content=$(printf '%s\n' "$content" | strip_html_tags)
     fi
 
-    echo "$content"
+    printf '%s\n' "$content"
 }
 
 # --- Change Detection ---
@@ -747,8 +749,8 @@ calculate_change_percent() {
 
     # Use diff to count changed lines
     local old_lines new_lines changed_lines
-    old_lines=$(echo "$old" | wc -l | tr -d ' ')
-    new_lines=$(echo "$new" | wc -l | tr -d ' ')
+    old_lines=$(printf '%s\n' "$old" | wc -l | tr -d ' ')
+    new_lines=$(printf '%s\n' "$new" | wc -l | tr -d ' ')
 
     if [ "$old_lines" -eq 0 ]; then
         old_lines=1
@@ -756,8 +758,8 @@ calculate_change_percent() {
 
     # Count differing lines (each side separately to avoid double-counting)
     local removed_count added_count
-    removed_count=$(diff <(echo "$old") <(echo "$new") 2>/dev/null | grep -c '^<' || true)
-    added_count=$(diff <(echo "$old") <(echo "$new") 2>/dev/null | grep -c '^>' || true)
+    removed_count=$(diff <(printf '%s\n' "$old") <(printf '%s\n' "$new") 2>/dev/null | grep -ac '^<' || true)
+    added_count=$(diff <(printf '%s\n' "$old") <(printf '%s\n' "$new") 2>/dev/null | grep -ac '^>' || true)
     if [ "$removed_count" -gt "$added_count" ]; then
         changed_lines="$removed_count"
     else
@@ -799,7 +801,7 @@ show_diff() {
     if [ "$HAS_DIFF" = true ]; then
         echo -e "${DIM}--- previous${NC}"
         echo -e "${DIM}+++ current${NC}"
-        diff <(echo "$old") <(echo "$new") 2>/dev/null | tail -n +3 || true
+        diff <(printf '%s\n' "$old") <(printf '%s\n' "$new") 2>/dev/null | tail -n +3 || true
     else
         echo -e "${YELLOW}(diff not available — install diffutils)${NC}"
     fi
@@ -821,7 +823,7 @@ save_snapshot() {
     timestamp=$(date '+%Y%m%d_%H%M%S')
     local filename="${SNAPSHOT_DIR}/snapshot_${timestamp}_${label}.txt"
 
-    echo "$content" > "$filename"
+    printf '%s\n' "$content" > "$filename"
     log_verbose "Snapshot saved: $filename"
 }
 
@@ -870,8 +872,11 @@ print_watch_config() {
     [ -n "$DISCORD_WEBHOOK" ] && channels+=("Discord")
     [ -n "$TELEGRAM_TOKEN" ] && [ -n "$TELEGRAM_CHAT_ID" ] && channels+=("Telegram")
     if [ ${#channels[@]} -gt 0 ]; then
-        local IFS=', '
-        echo -e "  ${CYAN}Notify:${NC}     ${channels[*]}"
+        local joined="" c
+        for c in "${channels[@]}"; do
+            joined="${joined:+$joined, }$c"
+        done
+        echo -e "  ${CYAN}Notify:${NC}     $joined"
     fi
     echo ""
 }
