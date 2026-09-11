@@ -300,6 +300,15 @@ check_dependencies() {
 
 # --- Argument Parsing ---
 
+# require_int <option> <value> <min> — exit 1 unless value is an integer >= min
+require_int() {
+    local option="$1" value="$2" min="$3"
+    if ! [[ "$value" =~ ^[0-9]+$ ]] || [ "$value" -lt "$min" ]; then
+        log_error "$option must be an integer >= $min (got '$value')"
+        exit 1
+    fi
+}
+
 parse_args() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -329,6 +338,7 @@ parse_args() {
                 ;;
             --timeout)
                 TIMEOUT="${2:?'--timeout requires a value'}"
+                require_int "--timeout" "$TIMEOUT" 1
                 shift 2
                 ;;
             --no-follow)
@@ -341,10 +351,7 @@ parse_args() {
                 ;;
             -i|--interval)
                 INTERVAL="${2:?'--interval requires a value'}"
-                if ! [[ "$INTERVAL" =~ ^[0-9]+$ ]] || [ "$INTERVAL" -lt 1 ]; then
-                    log_error "Interval must be a positive integer (seconds)"
-                    exit 1
-                fi
+                require_int "--interval" "$INTERVAL" 1
                 shift 2
                 ;;
             -p|--threshold)
@@ -357,6 +364,7 @@ parse_args() {
                 ;;
             -n|--max-runs)
                 MAX_RUNS="${2:?'--max-runs requires a value'}"
+                require_int "--max-runs" "$MAX_RUNS" 0
                 shift 2
                 ;;
             --once)
@@ -369,10 +377,12 @@ parse_args() {
                 ;;
             --retries)
                 RETRIES="${2:?'--retries requires a value'}"
+                require_int "--retries" "$RETRIES" 1
                 shift 2
                 ;;
             --retry-delay)
                 RETRY_DELAY="${2:?'--retry-delay requires a value'}"
+                require_int "--retry-delay" "$RETRY_DELAY" 0
                 shift 2
                 ;;
             -m|--mode)
@@ -818,6 +828,18 @@ cleanup() {
 
 # --- Main Watch Loop ---
 
+# check_max_runs <run_count> <change_count> — exit 0 once --max-runs is reached
+check_max_runs() {
+    local run_count="$1" change_count="$2"
+    if [ "$MAX_RUNS" -gt 0 ] && [ "$run_count" -ge "$MAX_RUNS" ]; then
+        echo ""
+        log_info "Reached max runs ($MAX_RUNS). Stopping."
+        log_info "Total changes detected: $change_count"
+        log_to_file "STOP — Reached $MAX_RUNS runs, $change_count changes detected"
+        exit 0
+    fi
+}
+
 main() {
     setup_colors
     parse_args "$@"
@@ -853,6 +875,7 @@ main() {
             if [ "$ONCE" = true ]; then
                 exit 1
             fi
+            check_max_runs "$run_count" "$change_count"
             print_countdown "$INTERVAL"
             continue
         fi
@@ -940,14 +963,7 @@ main() {
             fi
         fi
 
-        # Check max runs
-        if [ "$MAX_RUNS" -gt 0 ] && [ "$run_count" -ge "$MAX_RUNS" ]; then
-            echo ""
-            log_info "Reached max runs ($MAX_RUNS). Stopping."
-            log_info "Total changes detected: $change_count"
-            log_to_file "STOP — Reached $MAX_RUNS runs, $change_count changes detected"
-            exit 0
-        fi
+        check_max_runs "$run_count" "$change_count"
 
         # Single run mode
         if [ "$ONCE" = true ]; then

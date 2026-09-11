@@ -110,9 +110,11 @@ assert_not_contains() {
 # --- Helpers ------------------------------------------------------------------
 
 # Run script.sh under the current shell/locale; sets OUT (stdout+stderr) and RC.
+# Killed after $WW_TEST_TIMEOUT seconds (RC=124) so a runaway loop fails
+# instead of hanging the suite.
 ww() {
-    OUT=$(LC_ALL="$LOC" "$SH" "$SCRIPT" --no-color --no-sound "$@" 2>&1 < /dev/null)
-    RC=$?
+    run_bg "$@"
+    wait_bg "${WW_TEST_TIMEOUT:-20}"
 }
 
 # Run script.sh in the background; wait_bg collects OUT/RC (RC=124 on timeout).
@@ -208,7 +210,7 @@ t_unknown_option_rejected() {
 t_invalid_interval_rejected() {
     ww -i 0 "$BASE/a.json"
     assert_rc 1
-    assert_contains "$OUT" "positive integer"
+    assert_contains "$OUT" "--interval must be an integer >= 1"
 }
 
 t_invalid_mode_rejected() {
@@ -288,6 +290,41 @@ t_max_runs_stops_after_n_checks() {
     ww -i 1 -n 2 "$BASE/a.json"
     assert_rc 0
     assert_contains "$OUT" "Reached max runs (2)"
+}
+
+t_max_runs_counts_failed_fetches() {
+    # Port 1 refuses connections: every fetch fails, -n must still stop the loop.
+    run_bg -i 1 -n 2 --retries 1 --retry-delay 0 http://127.0.0.1:1/
+    wait_bg 8
+    assert_rc 0
+    assert_contains "$OUT" "Reached max runs (2)"
+}
+
+t_retries_zero_rejected() {
+    ww --retries 0 "$BASE/a.json"
+    assert_rc 1
+    assert_contains "$OUT" "--retries must be an integer >= 1"
+}
+
+t_non_integer_options_rejected() {
+    ww --retries abc "$BASE/a.json"
+    assert_rc 1
+    assert_contains "$OUT" "--retries must be an integer >= 1"
+    ww -n abc "$BASE/a.json"
+    assert_rc 1
+    assert_contains "$OUT" "--max-runs must be an integer >= 0"
+    ww --timeout 0 "$BASE/a.json"
+    assert_rc 1
+    assert_contains "$OUT" "--timeout must be an integer >= 1"
+    ww --retry-delay -1 "$BASE/a.json"
+    assert_rc 1
+    assert_contains "$OUT" "--retry-delay must be an integer >= 0"
+}
+
+t_retry_delay_zero_accepted() {
+    ww --once --retry-delay 0 "$BASE/a.json"
+    assert_rc 0
+    assert_contains "$OUT" "Baseline captured"
 }
 
 # --- Runner -------------------------------------------------------------------
