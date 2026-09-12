@@ -458,6 +458,33 @@ t_website_mode_strips_tags_with_quoted_angle_brackets() {
     assert_not_contains "$text" "meta"
 }
 
+t_perl_stripper_script_containing_comment_opener() {
+    ww --once -m website --baseline-file "$TMP/baseline" "$BASE/tricky.html"
+    assert_rc 0
+    local text
+    text=$(cat "$TMP/baseline")
+    assert_contains "$text" "Price"
+    assert_contains "$text" "Important"
+    assert_contains "$text" "Tail"
+    assert_not_contains "$text" "x()"
+    assert_not_contains "$text" "<!--"
+    assert_not_contains "$(tr '\n' ' ' < "$TMP/baseline")" "1 < 2"
+}
+
+t_entities_decoded_once() {
+    ww --once -m website --baseline-file "$TMP/baseline" "$BASE/tricky.html"
+    assert_rc 0
+    local text
+    text=$(cat "$TMP/baseline")
+    assert_contains "$text" "&lt;"
+    assert_contains "$(tr '\n' ' ' < "$TMP/baseline")" "Price: 5 &lt; 10"
+    assert_not_contains "$(tr '\n' ' ' < "$TMP/baseline")" "Price: 5 < 10"
+    assert_contains "$text" "$(printf '\360\237\230\200')"
+    assert_contains "$text" "&#1114112;"
+    assert_contains "$text" "&#xD800;"
+    assert_contains "$text" "&#57343;"
+}
+
 t_website_mode_sed_fallback_strips_scripts_styles_and_tags() {
     WW_HTML_STRIPPER="sed" ww --once -m website --baseline-file "$TMP/baseline" "$BASE/page.html"
     assert_rc 0

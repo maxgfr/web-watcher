@@ -648,28 +648,34 @@ detect_mode() {
 }
 
 # Decode the HTML entities that commonly appear in page text (byte-oriented,
-# so it is safe on any input encoding). Shared by both strippers below.
+# so it is safe on any input encoding). Used by the sed/awk fallback only.
 decode_html_entities() {
     sed 's/&nbsp;/ /g; s/&lt;/</g; s/&gt;/>/g; s/&quot;/"/g; s/&#39;/'"'"'/g; s/&#x27;/'"'"'/g; s/&apos;/'"'"'/g;
          s/&euro;/€/g; s/&copy;/©/g; s/&reg;/®/g; s/&amp;/\&/g'
 }
 
-# Perl stripper: one slurp pass, so comments, <script>/<style> blocks and
-# tags spanning several lines are removed whatever they contain. Numeric
-# entities (&#NNN; / &#xHH;) are decoded to UTF-8.
+# Perl stripper: remove comments and script/style blocks in opening order,
+# then tags. Decode named and numeric entities once to UTF-8 bytes, preserving
+# invalid code points and leaving the original page bytes untouched.
 strip_html_tags_perl() {
     perl -0777 -MEncode -pe '
-        s/<!--.*?-->/ /gs;
-        s/<script\b[^>]*>.*?<\/script\s*>/ /gis;
-        s/<style\b[^>]*>.*?<\/style\s*>/ /gis;
+        s/<!--.*?-->|<(script|style)\b[^>]*>.*?<\/\1\s*>/ /gis;
+        s/<!--.*\z/ /gs;
         # Tags, quote-aware: a ">" inside a quoted attribute value does not
         # end the tag, so the rest of the attribute cannot leak into the text.
         s/<[a-zA-Z!\/?][^>"'"'"']*(?:(?:"[^"]*"|'"'"'[^'"'"']*'"'"')[^>"'"'"']*)*>/ /gs;
         # Anything left that still looks like a tag (unbalanced quotes).
         s/<[a-zA-Z!\/?][^>]*>/ /gs;
-        s/&#x([0-9a-fA-F]+);/Encode::encode_utf8(chr(hex($1)))/ge;
-        s/&#([0-9]+);/Encode::encode_utf8(chr($1))/ge;
-    ' | decode_html_entities
+        my %named = (
+            nbsp => 32, lt => 60, gt => 62, quot => 34, apos => 39,
+            amp => 38, euro => 0x20AC, copy => 0xA9, reg => 0xAE
+        );
+        s/&(?:#(\d+)|#[xX]([0-9a-fA-F]+)|(nbsp|lt|gt|quot|apos|amp|euro|copy|reg));/
+            my $n = defined($1) ? 0 + $1 : defined($2) ? hex($2) : $named{$3};
+            $n == 0 || $n >= 0x110000 || ($n >= 0xD800 && $n <= 0xDFFF)
+                ? $& : Encode::encode_utf8(chr($n));
+        /ge;
+    '
 }
 
 # sed/awk fallback: join the document on one line, then put every tag on its
