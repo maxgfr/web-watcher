@@ -696,10 +696,9 @@ strip_html_tags() {
     fi
     log_verbose "HTML stripper: $stripper"
 
-    # LC_ALL=C gives sed/tr/awk byte semantics. Under a UTF-8 locale they
-    # abort with "illegal byte sequence" on a page whose bytes are not valid
-    # UTF-8 (a Latin-1 page, say), which used to empty the extracted text.
-    # Every pattern here is ASCII, so UTF-8 sequences pass through untouched.
+    # Under LC_ALL=C every tool works on bytes, never rejecting or
+    # reinterpreting multibyte sequences. Entity replacements are the only
+    # newly generated non-ASCII output and deliberately emit UTF-8 bytes.
     (
         export LC_ALL=C
         if [ "$stripper" = perl ]; then
@@ -750,6 +749,10 @@ process_content() {
 
 # --- Change Detection ---
 
+diff_lines() {
+    diff -a <(printf '%s\n' "$1") <(printf '%s\n' "$2") 2>/dev/null || true
+}
+
 calculate_change_percent() {
     local old="$1"
     local new="$2"
@@ -777,9 +780,10 @@ calculate_change_percent() {
     fi
 
     # Count differing lines (each side separately to avoid double-counting)
-    local removed_count added_count
-    removed_count=$(diff -a <(printf '%s\n' "$old") <(printf '%s\n' "$new") 2>/dev/null | grep -ac '^<' || true)
-    added_count=$(diff -a <(printf '%s\n' "$old") <(printf '%s\n' "$new") 2>/dev/null | grep -ac '^>' || true)
+    local diff_output removed_count added_count
+    diff_output=$(diff_lines "$old" "$new")
+    removed_count=$(printf '%s\n' "$diff_output" | grep -ac '^<' || true)
+    added_count=$(printf '%s\n' "$diff_output" | grep -ac '^>' || true)
     if [ "$removed_count" -gt "$added_count" ]; then
         changed_lines="$removed_count"
     else
@@ -821,7 +825,7 @@ show_diff() {
     if [ "$HAS_DIFF" = true ]; then
         echo -e "${DIM}--- previous${NC}"
         echo -e "${DIM}+++ current${NC}"
-        diff -a <(printf '%s\n' "$old") <(printf '%s\n' "$new") 2>/dev/null | tail -n +3 || true
+        diff_lines "$old" "$new" | tail -n +3 || true
     else
         echo -e "${YELLOW}(diff not available — install diffutils)${NC}"
     fi
