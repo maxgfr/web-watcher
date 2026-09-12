@@ -362,9 +362,7 @@ With `--max-runs`, the exit code is `1` if no fetch ever succeeded, otherwise `0
 
 ### Telegram
 
-1. Create a bot with [@BotFather](https://t.me/BotFather) and get the bot token
-2. Get your chat ID by messaging the bot and checking `https://api.telegram.org/bot<token>/getUpdates`
-3. Pass both with `--telegram-token` and `--telegram-chat`:
+Pass your Telegram bot token and chat ID with `--telegram-token` and `--telegram-chat`:
 
 ```bash
 ./script.sh --telegram-token 123456:ABC-DEF --telegram-chat 987654321 \
