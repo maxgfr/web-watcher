@@ -47,6 +47,7 @@ SHOW_DIFF=false
 ONCE=false
 MAX_RUNS=0
 STRIP_HTML=false
+FULL_PAGE=false
 HAS_DIFF=false
 BASELINE_FILE=""
 SLACK_WEBHOOK=""
@@ -254,6 +255,7 @@ print_usage() {
     echo "  -f, --filter <jq_expr>      jq filter for JSON responses (e.g., '.data.price')"
     echo "  -s, --selector <pattern>    Grep pattern to extract specific content from HTML"
     echo "  --strip-html                Force HTML tag stripping (useful with --mode api)"
+    echo "  --full-page                 Keep navigation, header, footer, aside and cookie-banner text (website mode)"
     echo "  --ignore <regex>            Drop lines matching this pattern before comparing (repeatable)"
     echo ""
     echo "Notification Options:"
@@ -441,6 +443,10 @@ parse_args() {
                 ;;
             --strip-html)
                 STRIP_HTML=true
+                shift
+                ;;
+            --full-page)
+                FULL_PAGE=true
                 shift
                 ;;
             --ignore)
@@ -660,12 +666,16 @@ decode_html_entities() {
          s/&euro;/€/g; s/&copy;/©/g; s/&reg;/®/g; s/&amp;/\&/g'
 }
 
-# Perl stripper: remove comments and script/style blocks in opening order,
+# Perl stripper: remove comments and raw blocks in opening order,
 # then tags. Decode named and numeric entities once to UTF-8 bytes, preserving
 # invalid code points and leaving the original page bytes untouched.
 strip_html_tags_perl() {
     perl -0777 -MEncode -pe '
-        s/<!--.*?-->|<(script|style|head|title)\b[^>]*>.*?<\/\1\s*>/ /gis;
+        my $raw = "script|style|noscript|svg|template|head|title";
+        $raw .= "|nav|header|footer|aside" unless ($ENV{WW_FULL_PAGE} // "false") eq "true";
+        # Raw blocks end at their first closing tag; nested nav blocks are
+        # deliberately cut at the first </nav>, without balancing nesting.
+        s/<!--.*?-->|<($raw)\b[^>]*>.*?<\/\1\s*>/ /gis;
         s/<!--.*\z/ /gs;
         s/[\r\n]+/ /g;
         # Tags, quote-aware: a ">" inside a quoted attribute value does not
@@ -799,8 +809,12 @@ strip_html_tags_sed() {
     decode_html_entities
 }
 
+drop_consent_lines() {
+    grep -aivE 'cookies?|consent|gdpr|accept all|reject all|manage (preferences|cookies|settings)|privacy (policy|preferences)' || true
+}
+
 strip_html_tags() {
-    # Remove comments, script/style blocks and tags, decode entities, then
+    # Remove comments, raw blocks and tags, decode entities, then
     # normalize whitespace within each line. WW_HTML_STRIPPER=perl|sed
     # forces an implementation; by default perl is used when available.
     local stripper="${WW_HTML_STRIPPER:-}"
@@ -814,13 +828,20 @@ strip_html_tags() {
     # newly generated non-ASCII output and deliberately emit UTF-8 bytes.
     (
         export LC_ALL=C
+        export WW_FULL_PAGE="$FULL_PAGE"
         if [ "$stripper" = perl ]; then
             strip_html_tags_perl
         else
             strip_html_tags_sed
         fi |
         sed -e 's/[[:space:]][[:space:]]*/ /g' \
-            -e 's/^ //' -e 's/ $//' -e '/^$/d'
+            -e 's/^ //' -e 's/ $//' -e '/^$/d' |
+        if [ "$FULL_PAGE" = true ]; then
+            cat
+        else
+            # Future webindex backend: skip this filter; webindex applies its own.
+            drop_consent_lines
+        fi
     )
 }
 
@@ -986,6 +1007,13 @@ print_watch_config() {
     echo -e "  ${CYAN}URL:${NC}        $URL"
     echo -e "  ${CYAN}Method:${NC}     $METHOD"
     echo -e "  ${CYAN}Mode:${NC}       $MODE"
+    if [ "$MODE" = website ] || [ "$MODE" = auto ]; then
+        if [ "$FULL_PAGE" = true ]; then
+            echo -e "  ${CYAN}Page:${NC}       full page"
+        else
+            echo -e "  ${CYAN}Page:${NC}       main content (use --full-page to keep chrome)"
+        fi
+    fi
     echo -e "  ${CYAN}Interval:${NC}   ${INTERVAL}s"
     if [ "$THRESHOLD" != "0" ]; then
         echo -e "  ${CYAN}Threshold:${NC}  ${THRESHOLD}%"

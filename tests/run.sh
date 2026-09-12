@@ -227,6 +227,7 @@ t_help_shows_usage() {
     assert_contains "$OUT" "--once"
     assert_contains "$OUT" "--baseline-file"
     assert_contains "$OUT" "--ignore"
+    assert_contains "$OUT" "--full-page"
 }
 
 t_missing_url_fails() {
@@ -525,6 +526,44 @@ EOF
     assert_eq "$(cat "$TMP/baseline")" "$expected"
 }
 
+t_chrome_blocks_removed_by_default() {
+    ww --once -m website --baseline-file "$TMP/baseline" "$BASE/blocks.html"
+    assert_rc 0
+    assert_contains "$OUT" "Page:       main content (use --full-page to keep chrome)"
+    local text
+    text=$(cat "$TMP/baseline")
+    assert_contains "$text" "Title"
+    assert_contains "$text" "Item A"
+    assert_not_contains "$text" "NavWord"
+    assert_not_contains "$text" "HeaderWord"
+    assert_not_contains "$text" "FooterWord"
+    assert_not_contains "$text" "AsideWord"
+    assert_not_contains "$text" "Accept all cookies"
+}
+
+t_full_page_keeps_chrome() {
+    ww --once -m website --full-page --baseline-file "$TMP/baseline" "$BASE/blocks.html"
+    assert_rc 0
+    assert_contains "$OUT" "Page:       full page"
+    local text
+    text=$(cat "$TMP/baseline")
+    assert_contains "$text" "Title"
+    assert_contains "$text" "Item A"
+    assert_contains "$text" "NavWord"
+    assert_contains "$text" "HeaderWord"
+    assert_contains "$text" "FooterWord"
+    assert_contains "$text" "AsideWord"
+    assert_contains "$text" "Accept all cookies"
+}
+
+t_sed_fallback_chrome_blocks_removed_by_default() {
+    WW_HTML_STRIPPER="sed" t_chrome_blocks_removed_by_default
+}
+
+t_sed_fallback_full_page_keeps_chrome() {
+    WW_HTML_STRIPPER="sed" t_full_page_keeps_chrome
+}
+
 t_website_mode_blocks_fixture() {
     ww --once -m website --baseline-file "$TMP/baseline" "$BASE/blocks.html"
     assert_rc 0
@@ -541,11 +580,6 @@ Row 2 Cell A
 Row 2 Cell B
 posted 3 minutes ago
 See the link now
-NavWord
-HeaderWord
-FooterWord
-AsideWord
-Accept all cookies
 EOF
 )
     assert_eq "$(cat "$TMP/baseline")" "$expected"
@@ -635,7 +669,7 @@ t_sed_fallback_unclosed_comment_keeps_text() {
 }
 
 t_sed_fallback_blocks_fixture() {
-    WW_HTML_STRIPPER="sed" WW_FULL_PAGE=true t_website_mode_blocks_fixture
+    WW_HTML_STRIPPER="sed" t_website_mode_blocks_fixture
 }
 
 t_sed_fallback_record_and_window_boundaries() {
