@@ -165,6 +165,12 @@ Webhook calls fail loudly: an HTTP error from Slack, Discord or Telegram is repo
 | `api` | Compares raw response body (JSON, XML, plain text) |
 | `website` | Strips HTML tags, normalizes whitespace, compares text content |
 
+In website mode with Perl, the compared text has one line per block (paragraph,
+list item, table cell, heading…). The change percentage is the share of these
+lines that differ. Source line breaks become spaces, including inside `<pre>`
+blocks; `<br>` starts a new line. The sed/awk fallback does not yet use block
+boundaries.
+
 ## Examples
 
 ### Watch a sneaker API for stock changes
@@ -321,6 +327,13 @@ Exit codes for `--once` mode:
 ./script.sh --telegram-token 123456:ABC-DEF --telegram-chat 987654321 \
   -i 30 https://api.example.com/data
 ```
+
+## Upgrading
+
+After upgrading to this version, an existing `--baseline-file` captured in
+website mode will be reported as changed exactly once because the stored text
+representation changed from one word per line to one line per block. `<pre>`
+blocks lose their internal line breaks.
 
 ## Tips
 

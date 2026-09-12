@@ -659,11 +659,15 @@ decode_html_entities() {
 # invalid code points and leaving the original page bytes untouched.
 strip_html_tags_perl() {
     perl -0777 -MEncode -pe '
-        s/<!--.*?-->|<(script|style)\b[^>]*>.*?<\/\1\s*>/ /gis;
+        s/<!--.*?-->|<(script|style|head|title)\b[^>]*>.*?<\/\1\s*>/ /gis;
         s/<!--.*\z/ /gs;
+        s/[\r\n]+/ /g;
         # Tags, quote-aware: a ">" inside a quoted attribute value does not
         # end the tag, so the rest of the attribute cannot leak into the text.
-        s/<[a-zA-Z!\/?][^>"'"'"']*(?:(?:"[^"]*"|'"'"'[^'"'"']*'"'"')[^>"'"'"']*)*>/ /gs;
+        s/<[a-zA-Z!\/?][^>"'"'"']*(?:(?:"[^"]*"|'"'"'[^'"'"']*'"'"')[^>"'"'"']*)*>/
+            $& =~ m{^<\/?(?:p|div|section|article|main|li|tr|td|th|ul|ol|dl|dt|dd|h[1-6]|pre|blockquote|table|br|hr|form|figure|option)(?=[\s\/>])}i
+                ? "\n" : " ";
+        /ge;
         # Anything left that still looks like a tag (unbalanced quotes).
         s/<[a-zA-Z!\/?][^>]*>/ /gs;
         my %named = (
@@ -694,7 +698,7 @@ strip_html_tags_sed() {
 
 strip_html_tags() {
     # Remove comments, script/style blocks and tags, decode entities, then
-    # normalize whitespace (one word per line). WW_HTML_STRIPPER=perl|sed
+    # normalize whitespace within each line. WW_HTML_STRIPPER=perl|sed
     # forces an implementation; by default perl is used when available.
     local stripper="${WW_HTML_STRIPPER:-}"
     if [ -z "$stripper" ]; then
@@ -712,8 +716,8 @@ strip_html_tags() {
         else
             strip_html_tags_sed
         fi |
-        tr -s '[:space:]' '\n' |
-        sed '/^$/d'
+        sed -e 's/[[:space:]][[:space:]]*/ /g' \
+            -e 's/^ //' -e 's/ $//' -e '/^$/d'
     )
 }
 

@@ -435,6 +435,48 @@ t_verbose_does_not_pollute_baseline() {
     assert_contains "$OUT" "[DEBUG] HTML stripper"
 }
 
+t_website_mode_one_line_per_block() {
+    ww --once -m website --baseline-file "$TMP/baseline" "$BASE/page.html"
+    assert_rc 0
+    local expected
+    expected=$(cat <<'EOF'
+Hello
+Price: 10 € © 'quoted'
+Product
+Visible
+EOF
+)
+    assert_eq "$(cat "$TMP/baseline")" "$expected"
+}
+
+t_website_mode_blocks_fixture() {
+    ww --once -m website --baseline-file "$TMP/baseline" "$BASE/blocks.html"
+    assert_rc 0
+    local expected
+    expected=$(cat <<'EOF'
+Title
+Paragraph one continues here and ends.
+Item A
+Item B
+second line
+Row 1 Cell A
+Row 1 Cell B
+Row 2 Cell A
+Row 2 Cell B
+posted 3 minutes ago
+See the link now
+NavWord
+HeaderWord
+FooterWord
+AsideWord
+Accept all cookies
+EOF
+)
+    assert_eq "$(cat "$TMP/baseline")" "$expected"
+    assert_eq "$(LC_ALL=C grep -c "$(printf '\t')" "$TMP/baseline")" "0"
+    assert_eq "$(LC_ALL=C grep -c '^ \| $' "$TMP/baseline")" "0"
+}
+
 t_website_mode_strips_scripts_styles_and_tags() {
     ww --once -m website --baseline-file "$TMP/baseline" "$BASE/page.html"
     assert_rc 0
