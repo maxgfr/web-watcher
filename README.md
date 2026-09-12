@@ -86,6 +86,28 @@ sudo pacman -S curl jq
   https://api.sneakers.com/v1/stock
 ```
 
+## Agent skill
+
+Install the [web-watcher skill](skills/web-watcher/SKILL.md) with the [skills CLI](https://github.com/vercel-labs/skills):
+
+```bash
+npx skills add maxgfr/web-watcher --skill web-watcher
+```
+
+For a global Codex installation:
+
+```bash
+npx skills add maxgfr/web-watcher --skill web-watcher --agent codex --global
+```
+
+The skill is **manual only** in Codex (`allow_implicit_invocation: false`) and Claude Code (`disable-model-invocation: true`). Invoke it as `$web-watcher` in Codex or `/web-watcher` in Claude Code, for example:
+
+```text
+$web-watcher Watch https://example.com/ every 60 seconds for 10 checks and show me content changes.
+```
+
+It guides the agent through selecting content, inspecting the baseline, starting the watch, and reporting changes or errors. The CLI must be installed separately, for example with `brew install maxgfr/tap/web-watcher`. Installing the skill does not start a watch. Other agents may handle invocation policies differently.
+
 ## Usage
 
 ```bash
