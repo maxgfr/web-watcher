@@ -32,6 +32,7 @@ BODY=""
 JQ_FILTER=""
 SELECTOR=""
 HEADERS=()
+IGNORE_PATTERNS=()
 COOKIES=""
 AUTH=""
 LOG_FILE=""
@@ -253,6 +254,7 @@ print_usage() {
     echo "  -f, --filter <jq_expr>      jq filter for JSON responses (e.g., '.data.price')"
     echo "  -s, --selector <pattern>    Grep pattern to extract specific content from HTML"
     echo "  --strip-html                Force HTML tag stripping (useful with --mode api)"
+    echo "  --ignore <regex>            Drop lines matching this pattern before comparing (repeatable)"
     echo ""
     echo "Notification Options:"
     echo "  --slack <url>               Slack incoming webhook URL"
@@ -440,6 +442,10 @@ parse_args() {
             --strip-html)
                 STRIP_HTML=true
                 shift
+                ;;
+            --ignore)
+                IGNORE_PATTERNS+=("${2:?'--ignore requires a value'}")
+                shift 2
                 ;;
             --slack)
                 SLACK_WEBHOOK="${2:?'--slack requires a value'}"
@@ -818,40 +824,53 @@ strip_html_tags() {
     )
 }
 
+apply_ignore_patterns() {
+    if [ ${#IGNORE_PATTERNS[@]} -gt 0 ]; then
+        local args=() pattern
+        for pattern in "${IGNORE_PATTERNS[@]}"; do
+            args+=(-e "$pattern")
+        done
+        LC_ALL=C grep -avE "${args[@]}" || true
+    else
+        cat
+    fi
+}
+
 process_content() {
     local content="$1"
     local resolved_mode="$2"
+    local fallback=false
 
     # Apply jq filter for JSON
     # printf rather than echo throughout: a response consisting of "-n" or
     # "-e" would otherwise be swallowed as an echo option.
     if [ -n "$JQ_FILTER" ]; then
         local filtered
-        filtered=$(printf '%s\n' "$content" | jq -r "$JQ_FILTER" 2>/dev/null) || {
+        if filtered=$(printf '%s\n' "$content" | jq -r "$JQ_FILTER" 2>/dev/null); then
+            content="$filtered"
+        else
             log_warn "jq filter failed, using raw content"
-            printf '%s\n' "$content"
-            return
-        }
-        content="$filtered"
+            fallback=true
+        fi
     fi
 
     # Apply grep selector
-    if [ -n "$SELECTOR" ]; then
+    if [ "$fallback" = false ] && [ -n "$SELECTOR" ]; then
         local selected
-        selected=$(printf '%s\n' "$content" | grep -ai "$SELECTOR" 2>/dev/null) || {
+        if selected=$(printf '%s\n' "$content" | grep -ai "$SELECTOR" 2>/dev/null); then
+            content="$selected"
+        else
             log_warn "Selector pattern not found, using full content"
-            printf '%s\n' "$content"
-            return
-        }
-        content="$selected"
+            fallback=true
+        fi
     fi
 
     # Strip HTML if website mode or forced
-    if [ "$resolved_mode" = "website" ] || [ "$STRIP_HTML" = true ]; then
+    if [ "$fallback" = false ] && { [ "$resolved_mode" = "website" ] || [ "$STRIP_HTML" = true ]; }; then
         content=$(printf '%s\n' "$content" | strip_html_tags)
     fi
 
-    printf '%s\n' "$content"
+    printf '%s\n' "$content" | apply_ignore_patterns
 }
 
 # --- Change Detection ---
@@ -981,6 +1000,9 @@ print_watch_config() {
     fi
     if [ -n "$SELECTOR" ]; then
         echo -e "  ${CYAN}Selector:${NC}   $SELECTOR"
+    fi
+    if [ ${#IGNORE_PATTERNS[@]} -gt 0 ]; then
+        echo -e "  ${CYAN}Ignore:${NC}     ${#IGNORE_PATTERNS[@]} pattern(s)"
     fi
     if [ -n "$BODY" ]; then
         echo -e "  ${CYAN}Body:${NC}       (${#BODY} bytes)"

@@ -226,6 +226,7 @@ t_help_shows_usage() {
     assert_contains "$OUT" "Usage:"
     assert_contains "$OUT" "--once"
     assert_contains "$OUT" "--baseline-file"
+    assert_contains "$OUT" "--ignore"
 }
 
 t_missing_url_fails() {
@@ -433,6 +434,81 @@ t_verbose_does_not_pollute_baseline() {
     assert_not_contains "$text" "[DEBUG]"
     assert_not_contains "$text" "stripper"
     assert_contains "$OUT" "[DEBUG] HTML stripper"
+}
+
+t_ignore_drops_lines_in_website_mode() {
+    ww --once -m website --ignore 'ago|points' --baseline-file "$TMP/baseline" "$BASE/blocks.html"
+    assert_rc 0
+    local text
+    text=$(cat "$TMP/baseline")
+    assert_not_contains "$text" "minutes ago"
+    assert_contains "$text" "Item A"
+}
+
+t_ignore_applies_in_api_mode() {
+    ww --once --ignore '"rating"' --baseline-file "$TMP/baseline" "$BASE/a.json"
+    assert_rc 0
+    local text
+    text=$(cat "$TMP/baseline")
+    assert_not_contains "$text" "rating"
+    assert_contains "$text" '"price": 10'
+}
+
+t_ignore_applies_when_jq_fails() {
+    ww --once -f '.[' --ignore '"rating"' --baseline-file "$TMP/baseline" "$BASE/a.json"
+    assert_rc 0
+    assert_contains "$OUT" "jq filter failed"
+    local text
+    text=$(cat "$TMP/baseline")
+    assert_not_contains "$text" "rating"
+    assert_contains "$text" "price"
+}
+
+t_ignore_changes_not_notified() {
+    ww --once -m website --ignore 'ago' --baseline-file "$TMP/baseline" "$BASE/blocks.html"
+    assert_rc 0
+    sed 's/posted 3 minutes ago/posted 9 minutes ago/' "$FIXTURES/blocks.html" > "$SERVE/blocks.html"
+    ww --once -m website --ignore 'ago' --baseline-file "$TMP/baseline" "$BASE/blocks.html"
+    assert_rc 0
+    assert_contains "$OUT" "No change"
+
+    sed -e 's/posted 3 minutes ago/posted 9 minutes ago/' -e 's/Item A/Item Z/' "$FIXTURES/blocks.html" > "$SERVE/blocks.html"
+    ww --once -m website --ignore 'ago' --baseline-file "$TMP/baseline" "$BASE/blocks.html"
+    assert_rc 2
+}
+
+t_ignore_shown_in_config() {
+    ww --once --ignore a --ignore b "$BASE/a.json"
+    assert_rc 0
+    assert_contains "$OUT" "Ignore:     2 pattern(s)"
+}
+
+t_ignore_applies_when_selector_not_found() {
+    ww --once -m website -s 'missing-selector' --ignore 'ago' --baseline-file "$TMP/baseline" "$BASE/blocks.html"
+    assert_rc 0
+    assert_contains "$OUT" "Selector pattern not found"
+    local text
+    text=$(cat "$TMP/baseline")
+    assert_not_contains "$text" "minutes ago"
+    assert_contains "$text" "Item A"
+    # The selector fallback still returns HTML, without later stripping.
+    assert_contains "$text" "<html>"
+}
+
+t_ignore_multiple_patterns_keep_non_utf8_content() {
+    printf 'abc\377\376def\ndrop one\n-drop two\nKeep\n' > "$SERVE/bin.dat"
+    ww --once --ignore '^drop' --ignore '-drop' --baseline-file "$TMP/baseline" "$BASE/bin.dat"
+    assert_rc 0
+    assert_eq "$(cat "$TMP/baseline")" "$(printf 'abc\377\376def\nKeep')"
+}
+
+t_ignore_can_drop_all_lines() {
+    ww --once --ignore '.*' --baseline-file "$TMP/baseline" "$BASE/a.json"
+    assert_rc 0
+    assert_eq "$(cat "$TMP/baseline")" ""
+    ww --once --ignore '.*' --baseline-file "$TMP/baseline" "$BASE/a.json"
+    assert_rc 0
+    assert_contains "$OUT" "No change"
 }
 
 t_website_mode_one_line_per_block() {
