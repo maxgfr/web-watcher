@@ -151,12 +151,20 @@ applescript_escape() {
 
 # Print $1 as a JSON string literal (quotes included).
 json_escape() {
-    local s="$1"
+    local LC_ALL=C s="$1" i ch hex
     s=${s//\\/\\\\}
     s=${s//\"/\\\"}
     s=${s//$'\n'/\\n}
     s=${s//$'\r'/\\r}
     s=${s//$'\t'/\\t}
+    # Escape the remaining C0 bytes; Bash strings cannot contain NUL.
+    for ((i = 1; i <= 31; i++)); do
+        case "$i" in 9|10|13) continue ;; esac
+        printf -v ch '%03o' "$i"
+        printf -v ch '%b' "\\$ch"
+        printf -v hex '%02x' "$i"
+        s=${s//"$ch"/\\u00$hex}
+    done
     printf '"%s"' "$s"
 }
 

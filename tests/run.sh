@@ -135,6 +135,19 @@ assert_not_contains() {
 
 # --- Helpers ------------------------------------------------------------------
 
+# Extract and call a pure script.sh function without HTTP, in a subshell under
+# the current shell/locale so unit tests exercise the same matrix as ww.
+ww_fn() {
+    local fn="$1"
+    shift
+    LC_ALL="$LOC" "$SH" -c '
+        set -euo pipefail
+        eval "$1"
+        shift
+        "$@"
+    ' ww_fn "$(sed -n "/^${fn}() {/,/^}/p" "$SCRIPT")" "$fn" "$@"
+}
+
 # Run script.sh under the current shell/locale; sets OUT (stdout+stderr) and RC.
 # Killed after $WW_TEST_TIMEOUT seconds (RC=124) so a runaway loop fails
 # instead of hanging the suite.
@@ -433,6 +446,32 @@ trigger_change() {
     ww --once --baseline-file "$TMP/baseline" "$@"
     sed 's/"price": 10/"price": 12/' "$FIXTURES/a.json" > "$SERVE/a.json"
     ww --once --baseline-file "$TMP/baseline" "$@"
+}
+
+t_json_escape_control_chars() {
+    local input escaped
+    input=$(printf 'a\033b\010c\001d\ttab\nnl"q\\bs')
+    escaped=$(ww_fn json_escape "$input")
+    if printf '%s' "$escaped" | "$PYTHON" -c '
+import json,sys
+v = json.loads(sys.stdin.read())
+assert v == sys.argv[1], repr(v)
+' "$input"; then pass; else fail "control characters did not round-trip through JSON"; fi
+    assert_contains "$escaped" '\u001b'
+    assert_contains "$escaped" '\u0008'
+
+    # Include every non-NUL C0 character, with a suffix to preserve newlines.
+    input=$(printf '\001\002\003\004\005\006\007\010\011\012\013\014\015\016\017\020\021\022\023\024\025\026\027\030\031\032\033\034\035\036\037end')
+    escaped=$(ww_fn json_escape "$input")
+    if printf '%s' "$escaped" | "$PYTHON" -c '
+import json,sys
+v = json.loads(sys.stdin.read())
+assert v == sys.argv[1], repr(v)
+' "$input"; then pass; else fail "full C0 range did not round-trip through JSON"; fi
+
+    # High bytes must remain untouched, even when invalid in the active locale.
+    input=$(printf '\200\303\251\377')
+    assert_eq "$(ww_fn json_escape "$input")" "\"$input\""
 }
 
 t_slack_webhook_sends_valid_json() {
