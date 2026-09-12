@@ -300,6 +300,9 @@ print_usage() {
     echo ""
     echo "  # Single check with persistent baseline (for cron jobs)"
     echo "  web-watcher --once --baseline-file /tmp/ww_status.txt https://api.example.com/status"
+    echo ""
+    echo "  # Watch Hacker News, ignoring the lines that always move"
+    echo "  web-watcher --once -m website --ignore 'ago|points' --baseline-file /tmp/hn.txt https://news.ycombinator.com/"
 }
 
 # --- Dependency Check ---

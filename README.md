@@ -53,7 +53,7 @@ sudo ln -s "$(pwd)/script.sh" /usr/local/bin/web-watcher
 
 ### Dependencies
 
-Only `curl` is required. `jq` is needed if you use the `--filter` option. In `website` mode, `perl` (present on macOS and nearly every Linux distribution) gives the most accurate HTML-to-text extraction; without it a sed/awk fallback is used. `python3` is only needed to run the test suite.
+Only `curl` is required. `jq` is needed if you use the `--filter` option. In `website` mode, `webindex` is recommended for the most accurate HTML-to-text extraction (`brew install maxgfr/tap/webindex`); the Homebrew formula for `web-watcher` installs it automatically. `perl` (present on macOS and nearly every Linux distribution) is recommended as a fallback; without either tool, a sed/awk fallback is used. `python3` is only needed to run the test suite.
 
 **macOS:**
 ```bash
@@ -126,6 +126,10 @@ web-watcher [options] <url>
 | `-f, --filter <jq>` | jq filter for JSON (e.g. `.data.price`) | — |
 | `-s, --selector <pattern>` | Grep pattern for HTML content | — |
 | `--strip-html` | Force strip HTML tags | disabled |
+| `--full-page` | Keep navigation, header, footer, aside and cookie-banner text (website mode) | disabled |
+| `--ignore <regex>` | Drop lines matching this pattern before comparing (repeatable) | — |
+
+`--ignore` accepts POSIX extended regular expressions (ERE) and applies in all modes.
 
 ### Notification Options
 
@@ -143,7 +147,9 @@ Webhook calls fail loudly: an HTTP error from Slack, Discord or Telegram is repo
 | Variable | Description | Default |
 |---|---|---|
 | `WW_TELEGRAM_API` | Base URL of the Telegram Bot API (useful for proxies or tests) | `https://api.telegram.org` |
-| `WW_HTML_STRIPPER` | Force the HTML-to-text implementation: `perl` or `sed` | `perl` if available, else `sed` |
+| `WW_HTML_STRIPPER` | Force the HTML-to-text implementation: `webindex`, `perl`, or `sed` | `webindex` if installed → `perl` if available → `sed` |
+
+`webindex` is preferred for balanced nested tags, charset detection, and main-content isolation. The `perl` and `sed` backends use regex-based stripping and a sed/awk scanner, respectively, without balancing nested tags: nested `<nav>` blocks are cut at the first `</nav>`.
 
 ### Output Options
 
@@ -165,11 +171,11 @@ Webhook calls fail loudly: an HTTP error from Slack, Discord or Telegram is repo
 | `api` | Compares raw response body (JSON, XML, plain text) |
 | `website` | Strips HTML tags, normalizes whitespace, compares text content |
 
-In website mode with Perl, the compared text has one line per block (paragraph,
+In website mode, the compared text has one line per block (paragraph,
 list item, table cell, heading…). The change percentage is the share of these
 lines that differ. Source line breaks become spaces, including inside `<pre>`
-blocks; `<br>` starts a new line. The sed/awk fallback does not yet use block
-boundaries.
+blocks; `<br>` starts a new line. Page chrome (nav, header, footer, aside) and
+cookie-banner lines are removed by default; use `--full-page` to keep them.
 
 ## Examples
 
@@ -188,6 +194,18 @@ boundaries.
 ```bash
 ./script.sh -m website -p 5 -i 120 \
   https://www.nike.com/launches
+```
+
+### Watch Hacker News, ignoring the lines that always move
+
+```bash
+web-watcher --once -m website --ignore 'ago|points' --baseline-file /tmp/hn.txt https://news.ycombinator.com/
+```
+
+### Watch a full page, including navigation and cookie-banner text
+
+```bash
+web-watcher -m website --full-page --diff https://example.com/
 ```
 
 ### Watch a specific section of a webpage
@@ -231,9 +249,12 @@ The `--baseline-file` flag persists the previous response to disk so `--once` ca
 With a threshold, a minor change below it does not replace the stored baseline, so drift accumulates until it crosses the threshold, exactly as in continuous mode.
 
 Exit codes for `--once` mode:
-- `0` — No change detected (or first run)
+
+- `0` — No change detected, change below threshold, or first run
 - `1` — Fetch error
-- `2` — Change detected
+- `2` — Change detected (meeting the threshold, if set)
+
+With `--max-runs`, the exit code is `1` if no fetch ever succeeded, otherwise `0`.
 
 ### Watch with cookie and Basic auth
 
@@ -263,7 +284,7 @@ Exit codes for `--once` mode:
 └────────┬────────┘
          │
 ┌────────▼────────┐
-│ Process Content │ ← jq filter → grep selector → strip HTML
+│ Process Content │ ← jq filter → grep selector → strip HTML → ignore matching lines
 └────────┬────────┘
          │
 ┌────────▼────────┐
@@ -330,9 +351,10 @@ Exit codes for `--once` mode:
 
 ## Upgrading
 
-After upgrading to this version, an existing `--baseline-file` captured in
+After upgrading to this version, an existing `--baseline-file` captured by an older version in
 website mode will be reported as changed exactly once because the stored text
-representation changed from one word per line to one line per block. `<pre>`
+representation changed from one word per line to one line per block. The change
+percentage is now per text line. `<pre>`
 blocks lose their internal line breaks.
 
 ## Tips
