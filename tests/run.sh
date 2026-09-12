@@ -138,14 +138,13 @@ assert_not_contains() {
 # Extract and call a pure script.sh function without HTTP, in a subshell under
 # the current shell/locale so unit tests exercise the same matrix as ww.
 ww_fn() {
-    local fn="$1"
+    local fn="$1" body
     shift
-    LC_ALL="$LOC" "$SH" -c '
-        set -euo pipefail
-        eval "$1"
-        shift
-        "$@"
-    ' ww_fn "$(sed -n "/^${fn}() {/,/^}/p" "$SCRIPT")" "$fn" "$@"
+    # A plain assignment on purpose: bash 3.2 (the harness shell on macOS
+    # runners) mis-parses a $( ) containing "()" when it is itself nested
+    # inside a double-quoted argument, and brace-expands "{" there too.
+    body=$(sed -n "/^$fn() [{]/,/^[}]/p" "$SCRIPT")
+    LC_ALL="$LOC" "$SH" -c 'set -euo pipefail; eval "$1"; shift; "$@"' ww_fn "$body" "$fn" "$@"
 }
 
 # Run script.sh under the current shell/locale; sets OUT (stdout+stderr) and RC.
@@ -439,6 +438,8 @@ t_webindex_backend() {
     text=$(cat "$TMP/baseline")
     assert_contains "$text" "Title"
     assert_contains "$text" "Item A"
+    assert_contains "$text" "Chocolate cookies: 10 EUR"
+    assert_contains "$text" "The General Data Privacy Regulation (GDPR) in the European Union"
     assert_not_contains "$text" "NavWord"
     assert_not_contains "$text" "Accept all cookies"
 
@@ -594,6 +595,35 @@ t_ignore_multiple_patterns_keep_non_utf8_content() {
     assert_eq "$(cat "$TMP/baseline")" "$(printf 'abc\377\376def\nKeep')"
 }
 
+t_ignore_invalid_regex_rejected() {
+    printf 'Existing baseline\n' > "$TMP/baseline"
+    cp "$TMP/baseline" "$TMP/baseline.before"
+    ww --once --ignore '[' --baseline-file "$TMP/baseline" "$BASE/a.json"
+    assert_rc 1
+    assert_contains "$OUT" "invalid regular expression"
+    if cmp -s "$TMP/baseline.before" "$TMP/baseline"; then pass; else fail "baseline changed"; fi
+}
+
+t_ignore_filter_failure_preserves_baseline() {
+    mkdir -p "$TMP/shim"
+    local real_grep
+    real_grep=$(command -v grep)
+    cat > "$TMP/shim/grep" <<'EOF'
+#!/bin/sh
+if [ "$1" = -avE ]; then exit 2; fi
+exec "$WW_REAL_GREP" "$@"
+EOF
+    chmod +x "$TMP/shim/grep"
+    printf 'Existing baseline\n' > "$TMP/baseline"
+    cp "$TMP/baseline" "$TMP/baseline.before"
+    WW_REAL_GREP="$real_grep" PATH="$TMP/shim:$PATH" \
+        ww --once --ignore 'rating' --baseline-file "$TMP/baseline" "$BASE/a.json"
+    assert_rc 1
+    assert_contains "$OUT" "ignore filter failed (grep exit 2)"
+    if cmp -s "$TMP/baseline.before" "$TMP/baseline"; then pass; else fail "baseline changed"; fi
+    rm -f "$TMP/shim/grep"
+}
+
 t_ignore_can_drop_all_lines() {
     ww --once --ignore '.*' --baseline-file "$TMP/baseline" "$BASE/a.json"
     assert_rc 0
@@ -618,6 +648,19 @@ EOF
     assert_eq "$(cat "$TMP/baseline")" "$expected"
 }
 
+t_consent_filter_keeps_prose_mentioning_cookies() {
+    local stripper text
+    for stripper in perl sed; do
+        rm -f "$TMP/baseline"
+        WW_HTML_STRIPPER="$stripper" ww --once -m website --baseline-file "$TMP/baseline" "$BASE/blocks.html"
+        assert_rc 0
+        text=$(cat "$TMP/baseline")
+        assert_contains "$text" "Chocolate cookies: 10 EUR"
+        assert_contains "$text" "The General Data Privacy Regulation (GDPR) in the European Union"
+        assert_not_contains "$text" "Accept all cookies"
+    done
+}
+
 t_chrome_blocks_removed_by_default() {
     # Legacy stripping removes every header/aside; webindex isolates main
     # content using its own policy (covered by t_webindex_backend).
@@ -632,6 +675,8 @@ t_chrome_blocks_removed_by_default() {
     assert_not_contains "$text" "HeaderWord"
     assert_not_contains "$text" "FooterWord"
     assert_not_contains "$text" "AsideWord"
+    assert_contains "$text" "Chocolate cookies: 10 EUR"
+    assert_contains "$text" "The General Data Privacy Regulation (GDPR) in the European Union"
     assert_not_contains "$text" "Accept all cookies"
 }
 
@@ -675,6 +720,8 @@ Row 2 Cell A
 Row 2 Cell B
 posted 3 minutes ago
 See the link now
+Chocolate cookies: 10 EUR
+The General Data Privacy Regulation (GDPR) in the European Union
 EOF
 )
     assert_eq "$(cat "$TMP/baseline")" "$expected"
@@ -762,6 +809,32 @@ t_sed_fallback_unclosed_comment_keeps_text() {
     text=$(cat "$TMP/baseline")
     assert_contains "$text" "Tail"
     assert_not_contains "$text" "<!--"
+}
+
+t_sed_fallback_self_closing_svg_keeps_content() {
+    printf '%s\n' '<p>Before</p><svg viewBox="0 0 10 10"/><p>Stock: 4</p>' > "$SERVE/svg.html"
+    local stripper text
+    for stripper in sed perl; do
+        rm -f "$TMP/baseline"
+        WW_HTML_STRIPPER="$stripper" ww --once -m website --baseline-file "$TMP/baseline" "$BASE/svg.html"
+        assert_rc 0
+        text=$(cat "$TMP/baseline")
+        assert_contains "$text" "Before"
+        assert_contains "$text" "Stock: 4"
+    done
+}
+
+t_omitted_head_end_tag_keeps_body() {
+    printf '%s\n' '<!doctype html><html><head><title>Store</title><body><p>Stock: 4</p></body></html>' > "$SERVE/head.html"
+    local stripper text
+    for stripper in perl sed; do
+        rm -f "$TMP/baseline"
+        WW_HTML_STRIPPER="$stripper" ww --once -m website --baseline-file "$TMP/baseline" "$BASE/head.html"
+        assert_rc 0
+        text=$(cat "$TMP/baseline")
+        assert_contains "$text" "Stock: 4"
+        assert_not_contains "$text" "Store"
+    done
 }
 
 t_sed_fallback_blocks_fixture() {

@@ -453,7 +453,13 @@ parse_args() {
                 shift
                 ;;
             --ignore)
-                IGNORE_PATTERNS+=("${2:?'--ignore requires a value'}")
+                local pattern="${2:?'--ignore requires a value'}" rc=0
+                printf '' | LC_ALL=C grep -aE -e "$pattern" >/dev/null 2>&1 || rc=$?
+                if [ "$rc" -gt 1 ]; then
+                    log_error "--ignore: invalid regular expression '$pattern'"
+                    exit 1
+                fi
+                IGNORE_PATTERNS+=("$pattern")
                 shift 2
                 ;;
             --slack)
@@ -674,11 +680,11 @@ decode_html_entities() {
 # invalid code points and leaving the original page bytes untouched.
 strip_html_tags_perl() {
     perl -0777 -MEncode -pe '
-        my $raw = "script|style|noscript|svg|template|head|title";
+        my $raw = "script|style|noscript|svg|template|title";
         $raw .= "|nav|header|footer|aside" unless ($ENV{WW_FULL_PAGE} // "false") eq "true";
         # Raw blocks end at their first closing tag; nested nav blocks are
         # deliberately cut at the first </nav>, without balancing nesting.
-        s/<!--.*?-->|<($raw)\b[^>]*>.*?<\/\1\s*>/ /gis;
+        s/<!--.*?-->|<head\b[^>]*>.*?(?:<\/head\s*>|(?=<body\b))|<($raw)\b[^>]*>.*?<\/\1\s*>/ /gis;
         s/<!--.*\z/ /gs;
         s/[\r\n]+/ /g;
         # Tags, quote-aware: a ">" inside a quoted attribute value does not
@@ -745,6 +751,7 @@ strip_html_tags_sed() {
                             pos += 1 + closing
                             name = quote = ""
                             naming = 1
+                            selfclosing = 0
                         } else {
                             printf "<"
                             pos++
@@ -752,6 +759,9 @@ strip_html_tags_sed() {
                     } else if (state == "TAG") {
                         for (i = 1; i <= width; i++) {
                             c = substr(rest, i, 1)
+                            if (quote == "" && c != ">" && c !~ /^[[:space:]]$/) {
+                                selfclosing = (c == "/")
+                            }
                             if (quote != "") {
                                 if (c == quote) quote = ""
                             } else if (c == "\"" || c == "'"'"'") {
@@ -759,7 +769,7 @@ strip_html_tags_sed() {
                                 naming = 0
                             } else if (c == ">") {
                                 state = "TEXT"
-                                if (!closing && (name ~ /^(script|style|noscript|svg|template|head|title)$/ ||
+                                if (!closing && !selfclosing && (name ~ /^(script|style|noscript|svg|template|head|title)$/ ||
                                     (full != 1 && name ~ /^(nav|header|footer|aside)$/))) {
                                     state = "RAW"
                                     raw_close = "</" name
@@ -784,7 +794,19 @@ strip_html_tags_sed() {
                     } else {
                         # COMMENT and RAW skip chunks with index(), never per byte.
                         needle = (state == "COMMENT" ? "-->" : (raw_end ? ">" : raw_close))
-                        at = index(state == "RAW" && !raw_end ? tolower(rest) : rest, needle)
+                        search = (state == "RAW" && !raw_end ? tolower(rest) : rest)
+                        at = index(search, needle)
+                        if (state == "RAW" && !raw_end && raw_close == "</head") {
+                            body_at = match(search, /<body([[:space:]\/>]|$)/)
+                            # A window edge is not a tag-name boundary; a record end is.
+                            if (body_at && body_at + 4 == width && offset + pos + width - 1 <= size) body_at = 0
+                            if (body_at && (!at || body_at < at)) {
+                                pos += body_at - 1
+                                state = "TEXT"
+                                printf " "
+                                continue
+                            }
+                        }
                         if (at) {
                             pos += at - 1 + length(needle)
                             if (state == "RAW" && !raw_end) {
@@ -813,7 +835,25 @@ strip_html_tags_sed() {
 }
 
 drop_consent_lines() {
-    grep -aivE 'cookies?|consent|gdpr|accept all|reject all|manage (preferences|cookies|settings)|privacy (policy|preferences)' || true
+    awk '
+        {
+            line = tolower($0)
+            hits = (line ~ /(^|[^a-z])cookies?([^a-z]|$)/)
+            hits += (line ~ /consent/)
+            hits += (line ~ /gdpr/)
+            hits += (line ~ /ccpa/)
+            hits += (line ~ /accept all/)
+            hits += (line ~ /reject all/)
+            hits += (line ~ /manage (preferences|choices|cookies|settings)/)
+            hits += (line ~ /privacy (policy|preferences|choices)/)
+            hits += (line ~ /tracking technolog/)
+            hits += (line ~ /advertising partners/)
+            hits += (line ~ /legitimate interest/)
+            action = (line ~ /accept|reject|decline|agree|allow|manage|preferences|settings|choices|opt[ -]out|we use cookies|this (site|website) uses cookies|by continuing|learn more|privacy policy|cookie policy/)
+            if (hits >= 2 || (hits == 1 && length($0) < 120 && action)) next
+            print
+        }
+    '
 }
 
 resolve_html_stripper() {
@@ -897,11 +937,15 @@ strip_html_tags() {
 
 apply_ignore_patterns() {
     if [ ${#IGNORE_PATTERNS[@]} -gt 0 ]; then
-        local args=() pattern
+        local args=() pattern rc=0
         for pattern in "${IGNORE_PATTERNS[@]}"; do
             args+=(-e "$pattern")
         done
-        LC_ALL=C grep -avE "${args[@]}" || true
+        LC_ALL=C grep -avE "${args[@]}" || rc=$?
+        if [ "$rc" -gt 1 ]; then
+            log_error "ignore filter failed (grep exit $rc)"
+            return 1
+        fi
     else
         cat
     fi
