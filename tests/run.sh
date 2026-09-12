@@ -364,6 +364,16 @@ check_stripped_page() {
     assert_not_contains "$1" "&#x27;"
 }
 
+t_verbose_does_not_pollute_baseline() {
+    ww --once -v -m website --baseline-file "$TMP/baseline" "$BASE/page.html"
+    assert_rc 0
+    local text
+    text=$(cat "$TMP/baseline")
+    assert_not_contains "$text" "[DEBUG]"
+    assert_not_contains "$text" "stripper"
+    assert_contains "$OUT" "[DEBUG] HTML stripper"
+}
+
 t_website_mode_strips_scripts_styles_and_tags() {
     ww --once -m website --baseline-file "$TMP/baseline" "$BASE/page.html"
     assert_rc 0

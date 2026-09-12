@@ -95,7 +95,7 @@ log_change() {
 
 log_verbose() {
     if [ "$VERBOSE" = true ]; then
-        printf "${DIM}[DEBUG] %s${NC}\n" "$1"
+        printf "${DIM}[DEBUG] %s${NC}\n" "$1" >&2
     fi
 }
 
