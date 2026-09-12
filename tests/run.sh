@@ -302,6 +302,63 @@ t_once_no_change_exits_zero() {
     assert_contains "$OUT" "No change"
 }
 
+t_diff_shows_removed_and_added_lines() {
+    printf 'Price: 10 EUR\n' > "$SERVE/price.txt"
+    ww --once --baseline-file "$TMP/baseline" "$BASE/price.txt"
+    assert_rc 0
+
+    printf 'Price: 12 EUR\n' > "$SERVE/price.txt"
+    ww --once --diff --baseline-file "$TMP/baseline" "$BASE/price.txt"
+    assert_rc 2
+    assert_contains "$OUT" "--- previous"
+    assert_contains "$OUT" "+++ current"
+    assert_contains "$OUT" "@@ -1 +1 @@"
+    assert_contains "$OUT" "-Price: 10 EUR"
+    assert_contains "$OUT" "+Price: 12 EUR"
+    assert_eq "$(cat "$TMP/baseline")" "Price: 12 EUR"
+
+    printf 'Price: 12 EUR\nIn stock\n' > "$SERVE/price.txt"
+    ww --once --diff --baseline-file "$TMP/baseline" "$BASE/price.txt"
+    assert_rc 2
+    assert_contains "$OUT" "+In stock"
+
+    printf 'Price: 12 EUR\n' > "$SERVE/price.txt"
+    ww --once --diff --baseline-file "$TMP/baseline" "$BASE/price.txt"
+    assert_rc 2
+    assert_contains "$OUT" "-In stock"
+}
+
+t_webindex_detects_main_content_changes() {
+    if ! command -v webindex >/dev/null 2>&1; then
+        echo "  SKIP t_webindex_detects_main_content_changes (webindex not installed)"
+        return
+    fi
+    printf '<html><body><nav>Menu A</nav><main><h1>Product</h1><p>Price: 10 EUR</p></main></body></html>\n' > "$SERVE/product.html"
+    ww --once --baseline-file "$TMP/baseline" "$BASE/product.html"
+    assert_rc 0
+    assert_contains "$OUT" "Stripper:   webindex"
+    local original
+    original=$(cat "$TMP/baseline")
+
+    sed 's/Menu A/Menu B/' "$SERVE/product.html" > "$SERVE/updated.html"
+    mv "$SERVE/updated.html" "$SERVE/product.html"
+    ww --once --baseline-file "$TMP/baseline" "$BASE/product.html"
+    assert_rc 0
+    assert_eq "$(cat "$TMP/baseline")" "$original"
+
+    sed 's/10 EUR/12 EUR/' "$SERVE/product.html" > "$SERVE/updated.html"
+    mv "$SERVE/updated.html" "$SERVE/product.html"
+    ww --once --diff --baseline-file "$TMP/baseline" "$BASE/product.html"
+    assert_rc 2
+    assert_contains "$OUT" "-Price: 10 EUR"
+    assert_contains "$OUT" "+Price: 12 EUR"
+    assert_contains "$(cat "$TMP/baseline")" "Price: 12 EUR"
+    assert_not_contains "$(cat "$TMP/baseline")" "Menu B"
+
+    ww --once --baseline-file "$TMP/baseline" "$BASE/product.html"
+    assert_rc 0
+}
+
 t_change_percent_uses_decimal_point() {
     ww --once --baseline-file "$TMP/baseline" "$BASE/a.json"
     sed 's/"price": 10/"price": 12/' "$FIXTURES/a.json" > "$SERVE/a.json"

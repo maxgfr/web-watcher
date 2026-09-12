@@ -1066,7 +1066,9 @@ show_diff() {
     if [ "$HAS_DIFF" = true ]; then
         echo -e "${DIM}--- previous${NC}"
         echo -e "${DIM}+++ current${NC}"
-        diff_lines "$old" "$new" | tail -n +3 || true
+        # Only unified diffs have two file headers to replace with our labels.
+        # Keep diff_lines in normal format for the change-percentage counters.
+        diff -au <(printf '%s\n' "$old") <(printf '%s\n' "$new") 2>/dev/null | tail -n +3 || true
     else
         echo -e "${YELLOW}(diff not available — install diffutils)${NC}"
     fi
