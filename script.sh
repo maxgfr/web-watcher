@@ -933,14 +933,20 @@ persist_baseline() {
     fi
 }
 
-# check_max_runs <run_count> <change_count> — exit 0 once --max-runs is reached
+# check_max_runs <run_count> <change_count> <success_count> — stop at --max-runs;
+# exit 1 if every fetch failed, otherwise exit 0
 check_max_runs() {
-    local run_count="$1" change_count="$2"
+    local run_count="$1" change_count="$2" success_count="$3"
     if [ "$MAX_RUNS" -gt 0 ] && [ "$run_count" -ge "$MAX_RUNS" ]; then
         echo ""
         log_info "Reached max runs ($MAX_RUNS). Stopping."
         log_info "Total changes detected: $change_count"
         log_to_file "STOP — Reached $MAX_RUNS runs, $change_count changes detected"
+        if [ "$success_count" -eq 0 ]; then
+            log_error "No successful fetch in $run_count runs"
+            log_to_file "No successful fetch in $run_count runs"
+            exit 1
+        fi
         exit 0
     fi
 }
@@ -962,6 +968,7 @@ main() {
     local previous_content=""
     local run_count=0
     local change_count=0
+    local success_count=0
     local first_run=true
     local resolved_mode=""
     local start_time
@@ -980,10 +987,11 @@ main() {
             if [ "$ONCE" = true ]; then
                 exit 1
             fi
-            check_max_runs "$run_count" "$change_count"
+            check_max_runs "$run_count" "$change_count" "$success_count"
             print_countdown "$INTERVAL"
             continue
         fi
+        success_count=$((success_count + 1))
 
         # Detect mode on first successful response
         if [ -z "$resolved_mode" ]; then
@@ -1064,8 +1072,6 @@ main() {
             fi
         fi
 
-        check_max_runs "$run_count" "$change_count"
-
         # Single run mode
         if [ "$ONCE" = true ]; then
             # A minor change (below threshold) still becomes the new baseline
@@ -1075,6 +1081,8 @@ main() {
             fi
             exit 0
         fi
+
+        check_max_runs "$run_count" "$change_count" "$success_count"
 
         # Countdown
         print_countdown "$INTERVAL"

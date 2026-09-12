@@ -283,6 +283,17 @@ t_once_detects_change_and_updates_baseline() {
     assert_eq "$(cat "$TMP/baseline")" "$(cat "$SERVE/a.json")"
 }
 
+t_once_with_max_runs_keeps_exit_code() {
+    ww --once -n 1 --baseline-file "$TMP/baseline" "$BASE/a.json"
+    assert_rc 0
+
+    sed 's/"price": 10/"price": 12/' "$FIXTURES/a.json" > "$SERVE/a.json"
+    ww --once -n 1 --baseline-file "$TMP/baseline" "$BASE/a.json"
+    assert_rc 2
+    assert_contains "$OUT" "CHANGE DETECTED"
+    assert_eq "$(cat "$TMP/baseline")" "$(cat "$SERVE/a.json")"
+}
+
 t_once_no_change_exits_zero() {
     ww --once --baseline-file "$TMP/baseline" "$BASE/a.json"
     ww --once --baseline-file "$TMP/baseline" "$BASE/a.json"
@@ -335,8 +346,9 @@ t_max_runs_counts_failed_fetches() {
     # Port 1 refuses connections: every fetch fails, -n must still stop the loop.
     run_bg -i 1 -n 2 --retries 1 --retry-delay 0 http://127.0.0.1:1/
     wait_bg 8
-    assert_rc 0
+    assert_rc 1
     assert_contains "$OUT" "Reached max runs (2)"
+    assert_contains "$OUT" "No successful fetch in 2 runs"
 }
 
 t_retries_zero_rejected() {
