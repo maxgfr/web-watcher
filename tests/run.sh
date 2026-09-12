@@ -9,7 +9,8 @@
 #
 #  Every test runs under each shell in $WW_TEST_SHELLS (default: bash from
 #  PATH plus /bin/bash when it is a different binary) and each locale in
-#  $WW_TEST_LOCALES (default: C).
+#  $WW_TEST_LOCALES (default: C fr_FR.UTF-8; missing fr_FR.UTF-8 is fatal).
+#  Set WW_TEST_LOCALES=C to explicitly run without the decimal-comma locale.
 # ==============================================================================
 
 set -u
@@ -84,11 +85,11 @@ if [ -z "${WW_TEST_SHELLS:-}" ]; then
 fi
 if [ -z "${WW_TEST_LOCALES:-}" ]; then
     # A locale with a decimal comma catches number-formatting bugs (awk/printf).
-    WW_TEST_LOCALES="C"
     if locale -a 2>/dev/null | grep -qi '^fr_FR\.utf-\{0,1\}8$'; then
         WW_TEST_LOCALES="C fr_FR.UTF-8"
     else
-        echo "WARN: locale fr_FR.UTF-8 not installed, decimal-comma tests skipped" >&2
+        echo "FATAL: locale fr_FR.UTF-8 not installed; set WW_TEST_LOCALES=C to explicitly skip decimal-comma tests" >&2
+        exit 1
     fi
 fi
 
@@ -188,7 +189,7 @@ last_hook() {
     local latest
     latest=$(ls "$HOOKS"/*.json 2>/dev/null | tail -1)
     [ -n "$latest" ] || return 1
-    python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))[sys.argv[2]])' "$latest" "$1"
+    "$PYTHON" -c 'import json,sys; print(json.load(open(sys.argv[1]))[sys.argv[2]])' "$latest" "$1"
 }
 
 # 0 if the last recorded webhook body is valid JSON.
@@ -196,7 +197,7 @@ last_hook_body_is_json() {
     local latest
     latest=$(ls "$HOOKS"/*.json 2>/dev/null | tail -1)
     [ -n "$latest" ] || return 1
-    python3 -c 'import json,sys; json.loads(json.load(open(sys.argv[1]))["body"])' "$latest" 2>/dev/null
+    "$PYTHON" -c 'import json,sys; json.loads(json.load(open(sys.argv[1]))["body"])' "$latest" 2>/dev/null
 }
 
 reset_fixtures() {
@@ -447,7 +448,7 @@ t_telegram_sends_full_message_urlencoded() {
     assert_eq "$(hook_count)" "1"
     assert_contains "$(last_hook path)" "/bot123:abc/sendMessage"
     local text
-    text=$(python3 -c 'import sys,urllib.parse; q=urllib.parse.parse_qs(sys.stdin.read()); print(q["chat_id"][0]); print(q["text"][0])' <<< "$(last_hook body)")
+    text=$("$PYTHON" -c 'import sys,urllib.parse; q=urllib.parse.parse_qs(sys.stdin.read()); print(q["chat_id"][0]); print(q["text"][0])' <<< "$(last_hook body)")
     assert_contains "$text" "42"
     assert_contains "$text" "Change Detected"
     assert_contains "$text" "a.json?x=1&y=my_value"
