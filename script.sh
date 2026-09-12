@@ -813,33 +813,80 @@ drop_consent_lines() {
     grep -aivE 'cookies?|consent|gdpr|accept all|reject all|manage (preferences|cookies|settings)|privacy (policy|preferences)' || true
 }
 
+resolve_html_stripper() {
+    if [ -n "${WW_HTML_STRIPPER:-}" ]; then
+        printf '%s\n' "$WW_HTML_STRIPPER"
+    elif command -v webindex >/dev/null 2>&1; then
+        echo webindex
+    elif command -v perl >/dev/null 2>&1; then
+        echo perl
+    else
+        echo sed
+    fi
+}
+
+strip_html_tags_webindex() {
+    local tmp output rc=0 fallback=perl
+    tmp=$(mktemp "${TMPDIR:-/tmp}/ww.XXXXXX") || return $?
+    mv "$tmp" "$tmp.html" || { rc=$?; rm -f "$tmp"; return "$rc"; }
+    tmp="$tmp.html"
+    cat > "$tmp" || { rc=$?; rm -f "$tmp"; return "$rc"; }
+    if [ "$FULL_PAGE" = true ]; then
+        output=$(webindex extract "$tmp" --full-page) || rc=$?
+    else
+        output=$(webindex extract "$tmp") || rc=$?
+    fi
+    if [ "$rc" -ne 0 ]; then
+        if ! command -v perl >/dev/null 2>&1; then fallback="sed"; fi
+        log_warn "webindex extract failed (exit $rc), falling back to $fallback"
+        rc=0
+        if [ "$fallback" = perl ]; then
+            output=$(strip_html_tags_perl < "$tmp") || rc=$?
+        else
+            output=$(strip_html_tags_sed < "$tmp") || rc=$?
+        fi
+        # The outer filter is skipped for webindex, so apply the legacy
+        # consent policy here only when a legacy backend actually ran.
+        if [ "$FULL_PAGE" = false ]; then
+            output=$(printf '%s\n' "$output" |
+                sed -e 's/[[:space:]][[:space:]]*/ /g' \
+                    -e 's/^ //' -e 's/ $//' -e '/^$/d' |
+                drop_consent_lines) || rc=$?
+        fi
+    fi
+    if [ "$rc" -eq 0 ]; then
+        printf '%s\n' "$output" || rc=$?
+    fi
+    rm -f "$tmp"
+    return "$rc"
+}
+
 strip_html_tags() {
     # Remove comments, raw blocks and tags, decode entities, then
-    # normalize whitespace within each line. WW_HTML_STRIPPER=perl|sed
-    # forces an implementation; by default perl is used when available.
-    local stripper="${WW_HTML_STRIPPER:-}"
-    if [ -z "$stripper" ]; then
-        if command -v perl &>/dev/null; then stripper="perl"; else stripper="sed"; fi
-    fi
+    # normalize whitespace within each line. WW_HTML_STRIPPER=webindex|perl|sed
+    # forces an implementation; auto prefers webindex, then perl, then sed.
+    local stripper
+    stripper=$(resolve_html_stripper)
     log_verbose "HTML stripper: $stripper"
 
     # Under LC_ALL=C every tool works on bytes, never rejecting or
-    # reinterpreting multibyte sequences. Entity replacements are the only
-    # newly generated non-ASCII output and deliberately emit UTF-8 bytes.
+    # reinterpreting multibyte sequences. webindex handles input decoding;
+    # the other backends preserve input bytes and emit UTF-8 for entities.
     (
         export LC_ALL=C
         export WW_FULL_PAGE="$FULL_PAGE"
-        if [ "$stripper" = perl ]; then
+        if [ "$stripper" = webindex ]; then
+            strip_html_tags_webindex
+        elif [ "$stripper" = perl ]; then
             strip_html_tags_perl
         else
             strip_html_tags_sed
         fi |
         sed -e 's/[[:space:]][[:space:]]*/ /g' \
             -e 's/^ //' -e 's/ $//' -e '/^$/d' |
-        if [ "$FULL_PAGE" = true ]; then
+        if [ "$FULL_PAGE" = true ] || [ "$stripper" = webindex ]; then
             cat
         else
-            # Future webindex backend: skip this filter; webindex applies its own.
             drop_consent_lines
         fi
     )
@@ -1008,6 +1055,7 @@ print_watch_config() {
     echo -e "  ${CYAN}Method:${NC}     $METHOD"
     echo -e "  ${CYAN}Mode:${NC}       $MODE"
     if [ "$MODE" = website ] || [ "$MODE" = auto ]; then
+        echo -e "  ${CYAN}Stripper:${NC}   $(resolve_html_stripper)"
         if [ "$FULL_PAGE" = true ]; then
             echo -e "  ${CYAN}Page:${NC}       full page"
         else

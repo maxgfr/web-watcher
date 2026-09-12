@@ -427,6 +427,97 @@ check_stripped_page() {
     assert_not_contains "$1" "&#x27;"
 }
 
+t_webindex_backend() {
+    if ! command -v webindex >/dev/null 2>&1; then
+        echo "  SKIP t_webindex_backend (webindex not installed)"
+        return
+    fi
+    ww --once -m website --baseline-file "$TMP/baseline" "$BASE/blocks.html"
+    assert_rc 0
+    assert_contains "$OUT" "Stripper:   webindex"
+    local text
+    text=$(cat "$TMP/baseline")
+    assert_contains "$text" "Title"
+    assert_contains "$text" "Item A"
+    assert_not_contains "$text" "NavWord"
+    assert_not_contains "$text" "Accept all cookies"
+
+    rm -f "$TMP/baseline"
+    ww --once -m website --full-page --baseline-file "$TMP/baseline" "$BASE/blocks.html"
+    assert_rc 0
+    assert_contains "$(cat "$TMP/baseline")" "NavWord"
+    assert_contains "$(cat "$TMP/baseline")" "Accept all cookies"
+}
+
+t_webindex_fallback_when_missing() {
+    mkdir -p "$TMP/shim" "$TMP/extract-tmp"
+    cat > "$TMP/shim/webindex" <<'EOF'
+#!/bin/sh
+echo 'partial failed extraction'
+echo 'unknown flag' >&2
+exit 2
+EOF
+    chmod +x "$TMP/shim/webindex"
+    local before after text
+    before=$(find "$TMP/extract-tmp" -name 'ww.*' | wc -l)
+    WW_HTML_STRIPPER=webindex PATH="$TMP/shim:$PATH" TMPDIR="$TMP/extract-tmp" \
+        ww --once -m website --baseline-file "$TMP/baseline" "$BASE/page.html"
+    assert_rc 0
+    assert_contains "$OUT" "[WARN] webindex extract failed (exit 2), falling back to perl"
+    text=$(cat "$TMP/baseline")
+    assert_contains "$text" "Hello"
+    assert_contains "$text" "Product"
+    assert_not_contains "$text" "partial failed extraction"
+    after=$(find "$TMP/extract-tmp" -name 'ww.*' | wc -l)
+    assert_eq "$after" "$before"
+
+    rm -f "$TMP/baseline"
+    WW_HTML_STRIPPER=webindex PATH="$TMP/shim:$PATH" TMPDIR="$TMP/extract-tmp" \
+        ww --once -m website --baseline-file "$TMP/baseline" "$BASE/blocks.html"
+    assert_rc 0
+    assert_not_contains "$(cat "$TMP/baseline")" "Accept all cookies"
+
+    rm -f "$TMP/baseline"
+    WW_HTML_STRIPPER=webindex PATH="$TMP/shim:$PATH" TMPDIR="$TMP/extract-tmp" \
+        ww --once -m website --full-page --baseline-file "$TMP/baseline" "$BASE/blocks.html"
+    assert_rc 0
+    assert_contains "$OUT" "[WARN] webindex extract failed"
+    assert_contains "$(cat "$TMP/baseline")" "NavWord"
+    assert_contains "$(cat "$TMP/baseline")" "Accept all cookies"
+    after=$(find "$TMP/extract-tmp" -name 'ww.*' | wc -l)
+    assert_eq "$after" "$before"
+    rm -f "$TMP/shim/webindex"
+}
+
+t_webindex_forced_when_present() {
+    if ! command -v webindex >/dev/null 2>&1; then
+        echo "  SKIP t_webindex_forced_when_present (webindex not installed)"
+        return
+    fi
+    WW_HTML_STRIPPER=webindex ww --once -m website --baseline-file "$TMP/baseline" "$BASE/blocks.html"
+    assert_rc 0
+    assert_contains "$OUT" "Stripper:   webindex"
+    assert_contains "$(cat "$TMP/baseline")" "# Title"
+}
+
+t_webindex_fallback_without_perl() {
+    mkdir -p "$TMP/nopath" "$TMP/extract-tmp"
+    local tool text
+    # Exercise a genuinely missing webindex and perl, keeping only the
+    # commands needed by the CLI (and the shell used by the test matrix).
+    for tool in bash curl sed grep awk tr cat mktemp rm mv date sleep diff wc mkdir jq; do
+        ln -sf "$(command -v "$tool")" "$TMP/nopath/$tool"
+    done
+    WW_HTML_STRIPPER=webindex PATH="$TMP/nopath" TMPDIR="$TMP/extract-tmp" \
+        ww --once -m website --baseline-file "$TMP/baseline" "$BASE/page.html"
+    assert_rc 0
+    assert_contains "$OUT" "[WARN] webindex extract failed (exit 127), falling back to sed"
+    text=$(cat "$TMP/baseline")
+    assert_contains "$text" "Hello"
+    assert_contains "$text" "Product"
+    assert_eq "$(find "$TMP/extract-tmp" -name 'ww.*' | wc -l | tr -d ' ')" "0"
+}
+
 t_verbose_does_not_pollute_baseline() {
     ww --once -v -m website --baseline-file "$TMP/baseline" "$BASE/page.html"
     assert_rc 0
@@ -513,7 +604,8 @@ t_ignore_can_drop_all_lines() {
 }
 
 t_website_mode_one_line_per_block() {
-    ww --once -m website --baseline-file "$TMP/baseline" "$BASE/page.html"
+    # This exact plain-heading format belongs to the legacy stripper.
+    WW_HTML_STRIPPER=perl ww --once -m website --baseline-file "$TMP/baseline" "$BASE/page.html"
     assert_rc 0
     local expected
     expected=$(cat <<'EOF'
@@ -527,7 +619,9 @@ EOF
 }
 
 t_chrome_blocks_removed_by_default() {
-    ww --once -m website --baseline-file "$TMP/baseline" "$BASE/blocks.html"
+    # Legacy stripping removes every header/aside; webindex isolates main
+    # content using its own policy (covered by t_webindex_backend).
+    WW_HTML_STRIPPER="${WW_HTML_STRIPPER:-perl}" ww --once -m website --baseline-file "$TMP/baseline" "$BASE/blocks.html"
     assert_rc 0
     assert_contains "$OUT" "Page:       main content (use --full-page to keep chrome)"
     local text
@@ -565,7 +659,8 @@ t_sed_fallback_full_page_keeps_chrome() {
 }
 
 t_website_mode_blocks_fixture() {
-    ww --once -m website --baseline-file "$TMP/baseline" "$BASE/blocks.html"
+    # Shared legacy expectation; the sed wrapper can still select sed.
+    WW_HTML_STRIPPER="${WW_HTML_STRIPPER:-perl}" ww --once -m website --baseline-file "$TMP/baseline" "$BASE/blocks.html"
     assert_rc 0
     local expected
     expected=$(cat <<'EOF'
@@ -611,7 +706,7 @@ t_website_mode_strips_tags_with_quoted_angle_brackets() {
 }
 
 t_perl_stripper_script_containing_comment_opener() {
-    ww --once -m website --baseline-file "$TMP/baseline" "$BASE/tricky.html"
+    WW_HTML_STRIPPER=perl ww --once -m website --baseline-file "$TMP/baseline" "$BASE/tricky.html"
     assert_rc 0
     local text
     text=$(cat "$TMP/baseline")
@@ -624,7 +719,8 @@ t_perl_stripper_script_containing_comment_opener() {
 }
 
 t_entities_decoded_once() {
-    ww --once -m website --baseline-file "$TMP/baseline" "$BASE/tricky.html"
+    # Perl preserves invalid numeric entities; webindex replaces them.
+    WW_HTML_STRIPPER=perl ww --once -m website --baseline-file "$TMP/baseline" "$BASE/tricky.html"
     assert_rc 0
     local text
     text=$(cat "$TMP/baseline")
