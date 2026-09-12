@@ -32,6 +32,7 @@ BODY=""
 JQ_FILTER=""
 SELECTOR=""
 HEADERS=()
+IGNORE_PATTERNS=()
 COOKIES=""
 AUTH=""
 LOG_FILE=""
@@ -46,6 +47,7 @@ SHOW_DIFF=false
 ONCE=false
 MAX_RUNS=0
 STRIP_HTML=false
+FULL_PAGE=false
 HAS_DIFF=false
 BASELINE_FILE=""
 SLACK_WEBHOOK=""
@@ -95,7 +97,7 @@ log_change() {
 
 log_verbose() {
     if [ "$VERBOSE" = true ]; then
-        printf "${DIM}[DEBUG] %s${NC}\n" "$1"
+        printf "${DIM}[DEBUG] %s${NC}\n" "$1" >&2
     fi
 }
 
@@ -151,12 +153,20 @@ applescript_escape() {
 
 # Print $1 as a JSON string literal (quotes included).
 json_escape() {
-    local s="$1"
+    local LC_ALL=C s="$1" i ch hex
     s=${s//\\/\\\\}
     s=${s//\"/\\\"}
     s=${s//$'\n'/\\n}
     s=${s//$'\r'/\\r}
     s=${s//$'\t'/\\t}
+    # Escape the remaining C0 bytes; Bash strings cannot contain NUL.
+    for ((i = 1; i <= 31; i++)); do
+        case "$i" in 9|10|13) continue ;; esac
+        printf -v ch '%03o' "$i"
+        printf -v ch '%b' "\\$ch"
+        printf -v hex '%02x' "$i"
+        s=${s//"$ch"/\\u00$hex}
+    done
     printf '"%s"' "$s"
 }
 
@@ -245,6 +255,8 @@ print_usage() {
     echo "  -f, --filter <jq_expr>      jq filter for JSON responses (e.g., '.data.price')"
     echo "  -s, --selector <pattern>    Grep pattern to extract specific content from HTML"
     echo "  --strip-html                Force HTML tag stripping (useful with --mode api)"
+    echo "  --full-page                 Keep navigation, header, footer, aside and cookie-banner text (website mode)"
+    echo "  --ignore <regex>            Drop lines matching this pattern before comparing (repeatable)"
     echo ""
     echo "Notification Options:"
     echo "  --slack <url>               Slack incoming webhook URL"
@@ -288,6 +300,9 @@ print_usage() {
     echo ""
     echo "  # Single check with persistent baseline (for cron jobs)"
     echo "  web-watcher --once --baseline-file /tmp/ww_status.txt https://api.example.com/status"
+    echo ""
+    echo "  # Watch Hacker News, ignoring the lines that always move"
+    echo "  web-watcher --once -m website --ignore 'ago|points' --baseline-file /tmp/hn.txt https://news.ycombinator.com/"
 }
 
 # --- Dependency Check ---
@@ -328,11 +343,11 @@ check_dependencies() {
 
 # --- Argument Parsing ---
 
-# require_int <option> <value> <min> — exit 1 unless value is an integer >= min
+# require_int <option> <value> <min> — require an integer >= min, at most 9 digits
 require_int() {
     local option="$1" value="$2" min="$3"
-    if ! [[ "$value" =~ ^[0-9]+$ ]] || [ "$value" -lt "$min" ]; then
-        log_error "$option must be an integer >= $min (got '$value')"
+    if ! [[ "$value" =~ ^[0-9]{1,9}$ ]] || [ "$value" -lt "$min" ]; then
+        log_error "$option must be an integer >= $min (at most 9 digits) (got '$value')"
         exit 1
     fi
 }
@@ -432,6 +447,20 @@ parse_args() {
             --strip-html)
                 STRIP_HTML=true
                 shift
+                ;;
+            --full-page)
+                FULL_PAGE=true
+                shift
+                ;;
+            --ignore)
+                local pattern="${2:?'--ignore requires a value'}" rc=0
+                printf '' | LC_ALL=C grep -aE -e "$pattern" >/dev/null 2>&1 || rc=$?
+                if [ "$rc" -gt 1 ]; then
+                    log_error "--ignore: invalid regular expression '$pattern'"
+                    exit 1
+                fi
+                IGNORE_PATTERNS+=("$pattern")
+                shift 2
                 ;;
             --slack)
                 SLACK_WEBHOOK="${2:?'--slack requires a value'}"
@@ -640,107 +669,330 @@ detect_mode() {
 }
 
 # Decode the HTML entities that commonly appear in page text (byte-oriented,
-# so it is safe on any input encoding). Shared by both strippers below.
+# so it is safe on any input encoding). Used by the sed/awk fallback only.
 decode_html_entities() {
     sed 's/&nbsp;/ /g; s/&lt;/</g; s/&gt;/>/g; s/&quot;/"/g; s/&#39;/'"'"'/g; s/&#x27;/'"'"'/g; s/&apos;/'"'"'/g;
          s/&euro;/€/g; s/&copy;/©/g; s/&reg;/®/g; s/&amp;/\&/g'
 }
 
-# Perl stripper: one slurp pass, so comments, <script>/<style> blocks and
-# tags spanning several lines are removed whatever they contain. Numeric
-# entities (&#NNN; / &#xHH;) are decoded to UTF-8.
+# Perl stripper: remove comments and raw blocks in opening order,
+# then tags. Decode named and numeric entities once to UTF-8 bytes, preserving
+# invalid code points and leaving the original page bytes untouched.
 strip_html_tags_perl() {
     perl -0777 -MEncode -pe '
-        s/<!--.*?-->/ /gs;
-        s/<script\b[^>]*>.*?<\/script\s*>/ /gis;
-        s/<style\b[^>]*>.*?<\/style\s*>/ /gis;
+        my $raw = "script|style|noscript|svg|template|title";
+        $raw .= "|nav|header|footer|aside" unless ($ENV{WW_FULL_PAGE} // "false") eq "true";
+        # Raw blocks end at their first closing tag; nested nav blocks are
+        # deliberately cut at the first </nav>, without balancing nesting.
+        s/<!--.*?-->|<head\b[^>]*>.*?(?:<\/head\s*>|(?=<body\b))|<($raw)\b[^>]*>.*?<\/\1\s*>/ /gis;
+        s/<!--.*\z/ /gs;
+        s/[\r\n]+/ /g;
         # Tags, quote-aware: a ">" inside a quoted attribute value does not
         # end the tag, so the rest of the attribute cannot leak into the text.
-        s/<[a-zA-Z!\/?][^>"'"'"']*(?:(?:"[^"]*"|'"'"'[^'"'"']*'"'"')[^>"'"'"']*)*>/ /gs;
+        s/<[a-zA-Z!\/?][^>"'"'"']*(?:(?:"[^"]*"|'"'"'[^'"'"']*'"'"')[^>"'"'"']*)*>/
+            $& =~ m{^<\/?(?:p|div|section|article|main|li|tr|td|th|ul|ol|dl|dt|dd|h[1-6]|pre|blockquote|table|br|hr|form|figure|option)(?=[\s\/>])}i
+                ? "\n" : " ";
+        /ge;
         # Anything left that still looks like a tag (unbalanced quotes).
         s/<[a-zA-Z!\/?][^>]*>/ /gs;
-        s/&#x([0-9a-fA-F]+);/Encode::encode_utf8(chr(hex($1)))/ge;
-        s/&#([0-9]+);/Encode::encode_utf8(chr($1))/ge;
-    ' | decode_html_entities
+        my %named = (
+            nbsp => 32, lt => 60, gt => 62, quot => 34, apos => 39,
+            amp => 38, euro => 0x20AC, copy => 0xA9, reg => 0xAE
+        );
+        s/&(?:#(\d+)|#[xX]([0-9a-fA-F]+)|(nbsp|lt|gt|quot|apos|amp|euro|copy|reg));/
+            my $n = defined($1) ? 0 + $1 : defined($2) ? hex($2) : $named{$3};
+            $n == 0 || $n >= 0x110000 || ($n >= 0xD800 && $n <= 0xDFFF)
+                ? $& : Encode::encode_utf8(chr($n));
+        /ge;
+    '
 }
 
-# sed/awk fallback: join the document on one line, then put every tag on its
-# own line so line-range deletes can drop comments and script/style blocks
-# even when their content contains "<". Named entities only.
+# Streaming, byte-oriented awk fallback: skip comments/raw blocks in opening
+# order, scan quoted tags, and separate blocks. Use the limited sed entity
+# decoder; the caller normalizes each output line. Search windows stay bounded
+# so even a minified document does not repeatedly copy/lowercase its suffix.
 strip_html_tags_sed() {
-    tr '\n' ' ' |
-    awk '{ gsub(/</, "\n<"); gsub(/>/, ">\n"); print }' |
-    sed -e '/^<!--.*-->$/d' \
-        -e '/^<!--/,/-->$/d' \
-        -e '/^<[Ss][Cc][Rr][Ii][Pp][Tt]/,/^<\/[Ss][Cc][Rr][Ii][Pp][Tt]/d' \
-        -e '/^<[Ss][Tt][Yy][Ll][Ee]/,/^<\/[Ss][Tt][Yy][Ll][Ee]/d' \
-        -e '/^<[^>]*>$/d' |
+    awk -v full="$( [ "${WW_FULL_PAGE:-false}" = true ] && echo 1 || echo 0 )" '
+        BEGIN { state = "TEXT" }
+        {
+            size = length($0)
+            offset = 1
+            while (offset <= size) {
+                window = substr($0, offset, 4096)
+                limit = length(window)
+                # Keep lookahead for TEXT classification and skipped delimiters.
+                if (offset + limit <= size) limit -= 16
+                pos = 1
+                while (pos <= limit) {
+                    rest = substr(window, pos)
+                    width = length(rest)
+                    if (state == "TEXT") {
+                        at = index(rest, "<")
+                        if (!at) {
+                            printf "%s", rest
+                            pos += width
+                            continue
+                        }
+                        if (pos + at - 1 > limit) {
+                            printf "%s", substr(rest, 1, limit - pos + 1)
+                            pos = limit + 1
+                            continue
+                        }
+                        printf "%s", substr(rest, 1, at - 1)
+                        pos += at - 1
+                        # Look ahead in the record, including across a window edge.
+                        if (substr(window, pos, 4) == "<!--") {
+                            state = "COMMENT"
+                            pos += 4
+                            printf " "
+                        } else if (substr(window, pos + 1, 1) ~ /^[a-zA-Z\/!?]$/) {
+                            state = "TAG"
+                            closing = (substr(window, pos + 1, 1) == "/")
+                            pos += 1 + closing
+                            name = quote = ""
+                            naming = 1
+                            selfclosing = 0
+                        } else {
+                            printf "<"
+                            pos++
+                        }
+                    } else if (state == "TAG") {
+                        for (i = 1; i <= width; i++) {
+                            c = substr(rest, i, 1)
+                            if (quote == "" && c != ">" && c !~ /^[[:space:]]$/) {
+                                selfclosing = (c == "/")
+                            }
+                            if (quote != "") {
+                                if (c == quote) quote = ""
+                            } else if (c == "\"" || c == "'"'"'") {
+                                quote = c
+                                naming = 0
+                            } else if (c == ">") {
+                                state = "TEXT"
+                                if (!closing && !selfclosing && (name ~ /^(script|style|noscript|svg|template|head|title)$/ ||
+                                    (full != 1 && name ~ /^(nav|header|footer|aside)$/))) {
+                                    state = "RAW"
+                                    raw_close = "</" name
+                                    raw_end = 0
+                                    printf " "
+                                } else if (name ~ /^(p|div|section|article|main|li|tr|td|th|ul|ol|dl|dt|dd|h[1-6]|pre|blockquote|table|br|hr|form|figure|option)$/) {
+                                    printf "\n"
+                                } else {
+                                    printf " "
+                                }
+                                i++
+                                break
+                            } else if (c ~ /^[[:space:]\/]$/) {
+                                naming = 0
+                            } else if (naming && length(name) <= 10) {
+                                # No recognized name exceeds ten bytes. Cap unknown
+                                # names too, avoiding growing-string concatenation.
+                                name = name tolower(c)
+                            }
+                        }
+                        pos += i - 1
+                    } else {
+                        # COMMENT and RAW skip chunks with index(), never per byte.
+                        needle = (state == "COMMENT" ? "-->" : (raw_end ? ">" : raw_close))
+                        search = (state == "RAW" && !raw_end ? tolower(rest) : rest)
+                        at = index(search, needle)
+                        if (state == "RAW" && !raw_end && raw_close == "</head") {
+                            body_at = match(search, /<body([[:space:]\/>]|$)/)
+                            # A window edge is not a tag-name boundary; a record end is.
+                            if (body_at && body_at + 4 == width && offset + pos + width - 1 <= size) body_at = 0
+                            if (body_at && (!at || body_at < at)) {
+                                pos += body_at - 1
+                                state = "TEXT"
+                                printf " "
+                                continue
+                            }
+                        }
+                        if (at) {
+                            pos += at - 1 + length(needle)
+                            if (state == "RAW" && !raw_end) {
+                                raw_end = 1
+                            } else {
+                                state = "TEXT"
+                                printf " "
+                            }
+                        } else if (offset + pos + width - 1 <= size) {
+                            # Retain enough overlap for a delimiter crossing windows.
+                            pos += width - length(needle) + 1
+                        } else {
+                            pos += width
+                        }
+                    }
+                }
+                offset += pos - 1
+            }
+            if (state == "TEXT") printf " "
+            # A record separator is whitespace, including inside an open tag.
+            if (state == "TAG") naming = 0
+        }
+        END { printf "\n" }
+    ' |
     decode_html_entities
 }
 
-strip_html_tags() {
-    # Remove comments, script/style blocks and tags, decode entities, then
-    # normalize whitespace (one word per line). WW_HTML_STRIPPER=perl|sed
-    # forces an implementation; by default perl is used when available.
-    local stripper="${WW_HTML_STRIPPER:-}"
-    if [ -z "$stripper" ]; then
-        if command -v perl &>/dev/null; then stripper="perl"; else stripper="sed"; fi
+drop_consent_lines() {
+    awk '
+        {
+            line = tolower($0)
+            hits = (line ~ /(^|[^a-z])cookies?([^a-z]|$)/)
+            hits += (line ~ /consent/)
+            hits += (line ~ /gdpr/)
+            hits += (line ~ /ccpa/)
+            hits += (line ~ /accept all/)
+            hits += (line ~ /reject all/)
+            hits += (line ~ /manage (preferences|choices|cookies|settings)/)
+            hits += (line ~ /privacy (policy|preferences|choices)/)
+            hits += (line ~ /tracking technolog/)
+            hits += (line ~ /advertising partners/)
+            hits += (line ~ /legitimate interest/)
+            action = (line ~ /accept|reject|decline|agree|allow|manage|preferences|settings|choices|opt[ -]out|we use cookies|this (site|website) uses cookies|by continuing|learn more|privacy policy|cookie policy/)
+            if (hits >= 2 || (hits == 1 && length($0) < 120 && action)) next
+            print
+        }
+    '
+}
+
+resolve_html_stripper() {
+    if [ -n "${WW_HTML_STRIPPER:-}" ]; then
+        printf '%s\n' "$WW_HTML_STRIPPER"
+    elif command -v webindex >/dev/null 2>&1; then
+        echo webindex
+    elif command -v perl >/dev/null 2>&1; then
+        echo perl
+    else
+        echo sed
     fi
+}
+
+strip_html_tags_webindex() {
+    local tmp output rc=0 fallback=perl
+    tmp=$(mktemp "${TMPDIR:-/tmp}/ww.XXXXXX") || return $?
+    mv "$tmp" "$tmp.html" || { rc=$?; rm -f "$tmp"; return "$rc"; }
+    tmp="$tmp.html"
+    cat > "$tmp" || { rc=$?; rm -f "$tmp"; return "$rc"; }
+    if [ "$FULL_PAGE" = true ]; then
+        output=$(webindex extract "$tmp" --full-page) || rc=$?
+    else
+        output=$(webindex extract "$tmp") || rc=$?
+    fi
+    if [ "$rc" -ne 0 ]; then
+        if ! command -v perl >/dev/null 2>&1; then fallback="sed"; fi
+        log_warn "webindex extract failed (exit $rc), falling back to $fallback"
+        rc=0
+        if [ "$fallback" = perl ]; then
+            output=$(strip_html_tags_perl < "$tmp") || rc=$?
+        else
+            output=$(strip_html_tags_sed < "$tmp") || rc=$?
+        fi
+        # The outer filter is skipped for webindex, so apply the legacy
+        # consent policy here only when a legacy backend actually ran.
+        if [ "$FULL_PAGE" = false ]; then
+            output=$(printf '%s\n' "$output" |
+                sed -e 's/[[:space:]][[:space:]]*/ /g' \
+                    -e 's/^ //' -e 's/ $//' -e '/^$/d' |
+                drop_consent_lines) || rc=$?
+        fi
+    fi
+    if [ "$rc" -eq 0 ]; then
+        printf '%s\n' "$output" || rc=$?
+    fi
+    rm -f "$tmp"
+    return "$rc"
+}
+
+strip_html_tags() {
+    # Remove comments, raw blocks and tags, decode entities, then
+    # normalize whitespace within each line. WW_HTML_STRIPPER=webindex|perl|sed
+    # forces an implementation; auto prefers webindex, then perl, then sed.
+    local stripper
+    stripper=$(resolve_html_stripper)
     log_verbose "HTML stripper: $stripper"
 
-    # LC_ALL=C gives sed/tr/awk byte semantics. Under a UTF-8 locale they
-    # abort with "illegal byte sequence" on a page whose bytes are not valid
-    # UTF-8 (a Latin-1 page, say), which used to empty the extracted text.
-    # Every pattern here is ASCII, so UTF-8 sequences pass through untouched.
+    # Under LC_ALL=C every tool works on bytes, never rejecting or
+    # reinterpreting multibyte sequences. webindex handles input decoding;
+    # the other backends preserve input bytes and emit UTF-8 for entities.
     (
         export LC_ALL=C
-        if [ "$stripper" = perl ]; then
+        export WW_FULL_PAGE="$FULL_PAGE"
+        if [ "$stripper" = webindex ]; then
+            strip_html_tags_webindex
+        elif [ "$stripper" = perl ]; then
             strip_html_tags_perl
         else
             strip_html_tags_sed
         fi |
-        tr -s '[:space:]' '\n' |
-        sed '/^$/d'
+        sed -e 's/[[:space:]][[:space:]]*/ /g' \
+            -e 's/^ //' -e 's/ $//' -e '/^$/d' |
+        if [ "$FULL_PAGE" = true ] || [ "$stripper" = webindex ]; then
+            cat
+        else
+            drop_consent_lines
+        fi
     )
+}
+
+apply_ignore_patterns() {
+    if [ ${#IGNORE_PATTERNS[@]} -gt 0 ]; then
+        local args=() pattern rc=0
+        for pattern in "${IGNORE_PATTERNS[@]}"; do
+            args+=(-e "$pattern")
+        done
+        LC_ALL=C grep -avE "${args[@]}" || rc=$?
+        if [ "$rc" -gt 1 ]; then
+            log_error "ignore filter failed (grep exit $rc)"
+            return 1
+        fi
+    else
+        cat
+    fi
 }
 
 process_content() {
     local content="$1"
     local resolved_mode="$2"
+    local fallback=false
 
     # Apply jq filter for JSON
     # printf rather than echo throughout: a response consisting of "-n" or
     # "-e" would otherwise be swallowed as an echo option.
     if [ -n "$JQ_FILTER" ]; then
         local filtered
-        filtered=$(printf '%s\n' "$content" | jq -r "$JQ_FILTER" 2>/dev/null) || {
+        if filtered=$(printf '%s\n' "$content" | jq -r "$JQ_FILTER" 2>/dev/null); then
+            content="$filtered"
+        else
             log_warn "jq filter failed, using raw content"
-            printf '%s\n' "$content"
-            return
-        }
-        content="$filtered"
+            fallback=true
+        fi
     fi
 
     # Apply grep selector
-    if [ -n "$SELECTOR" ]; then
+    if [ "$fallback" = false ] && [ -n "$SELECTOR" ]; then
         local selected
-        selected=$(printf '%s\n' "$content" | grep -ai "$SELECTOR" 2>/dev/null) || {
+        if selected=$(printf '%s\n' "$content" | grep -ai "$SELECTOR" 2>/dev/null); then
+            content="$selected"
+        else
             log_warn "Selector pattern not found, using full content"
-            printf '%s\n' "$content"
-            return
-        }
-        content="$selected"
+            fallback=true
+        fi
     fi
 
     # Strip HTML if website mode or forced
-    if [ "$resolved_mode" = "website" ] || [ "$STRIP_HTML" = true ]; then
+    if [ "$fallback" = false ] && { [ "$resolved_mode" = "website" ] || [ "$STRIP_HTML" = true ]; }; then
         content=$(printf '%s\n' "$content" | strip_html_tags)
     fi
 
-    printf '%s\n' "$content"
+    printf '%s\n' "$content" | apply_ignore_patterns
 }
 
 # --- Change Detection ---
+
+diff_lines() {
+    diff -a <(printf '%s\n' "$1") <(printf '%s\n' "$2") 2>/dev/null || true
+}
 
 calculate_change_percent() {
     local old="$1"
@@ -769,9 +1021,10 @@ calculate_change_percent() {
     fi
 
     # Count differing lines (each side separately to avoid double-counting)
-    local removed_count added_count
-    removed_count=$(diff -a <(printf '%s\n' "$old") <(printf '%s\n' "$new") 2>/dev/null | grep -ac '^<' || true)
-    added_count=$(diff -a <(printf '%s\n' "$old") <(printf '%s\n' "$new") 2>/dev/null | grep -ac '^>' || true)
+    local diff_output removed_count added_count
+    diff_output=$(diff_lines "$old" "$new")
+    removed_count=$(printf '%s\n' "$diff_output" | grep -ac '^<' || true)
+    added_count=$(printf '%s\n' "$diff_output" | grep -ac '^>' || true)
     if [ "$removed_count" -gt "$added_count" ]; then
         changed_lines="$removed_count"
     else
@@ -813,7 +1066,7 @@ show_diff() {
     if [ "$HAS_DIFF" = true ]; then
         echo -e "${DIM}--- previous${NC}"
         echo -e "${DIM}+++ current${NC}"
-        diff -a <(printf '%s\n' "$old") <(printf '%s\n' "$new") 2>/dev/null | tail -n +3 || true
+        diff_lines "$old" "$new" | tail -n +3 || true
     else
         echo -e "${YELLOW}(diff not available — install diffutils)${NC}"
     fi
@@ -848,6 +1101,14 @@ print_watch_config() {
     echo -e "  ${CYAN}URL:${NC}        $URL"
     echo -e "  ${CYAN}Method:${NC}     $METHOD"
     echo -e "  ${CYAN}Mode:${NC}       $MODE"
+    if [ "$MODE" = website ] || [ "$MODE" = auto ]; then
+        echo -e "  ${CYAN}Stripper:${NC}   $(resolve_html_stripper)"
+        if [ "$FULL_PAGE" = true ]; then
+            echo -e "  ${CYAN}Page:${NC}       full page"
+        else
+            echo -e "  ${CYAN}Page:${NC}       main content (use --full-page to keep chrome)"
+        fi
+    fi
     echo -e "  ${CYAN}Interval:${NC}   ${INTERVAL}s"
     if [ "$THRESHOLD" != "0" ]; then
         echo -e "  ${CYAN}Threshold:${NC}  ${THRESHOLD}%"
@@ -862,6 +1123,9 @@ print_watch_config() {
     fi
     if [ -n "$SELECTOR" ]; then
         echo -e "  ${CYAN}Selector:${NC}   $SELECTOR"
+    fi
+    if [ ${#IGNORE_PATTERNS[@]} -gt 0 ]; then
+        echo -e "  ${CYAN}Ignore:${NC}     ${#IGNORE_PATTERNS[@]} pattern(s)"
     fi
     if [ -n "$BODY" ]; then
         echo -e "  ${CYAN}Body:${NC}       (${#BODY} bytes)"
@@ -925,14 +1189,20 @@ persist_baseline() {
     fi
 }
 
-# check_max_runs <run_count> <change_count> — exit 0 once --max-runs is reached
+# check_max_runs <run_count> <change_count> <success_count> — stop at --max-runs;
+# exit 1 if every fetch failed, otherwise exit 0
 check_max_runs() {
-    local run_count="$1" change_count="$2"
+    local run_count="$1" change_count="$2" success_count="$3"
     if [ "$MAX_RUNS" -gt 0 ] && [ "$run_count" -ge "$MAX_RUNS" ]; then
         echo ""
         log_info "Reached max runs ($MAX_RUNS). Stopping."
         log_info "Total changes detected: $change_count"
         log_to_file "STOP — Reached $MAX_RUNS runs, $change_count changes detected"
+        if [ "$success_count" -eq 0 ]; then
+            log_error "No successful fetch in $run_count runs"
+            log_to_file "No successful fetch in $run_count runs"
+            exit 1
+        fi
         exit 0
     fi
 }
@@ -954,6 +1224,7 @@ main() {
     local previous_content=""
     local run_count=0
     local change_count=0
+    local success_count=0
     local first_run=true
     local resolved_mode=""
     local start_time
@@ -972,10 +1243,11 @@ main() {
             if [ "$ONCE" = true ]; then
                 exit 1
             fi
-            check_max_runs "$run_count" "$change_count"
+            check_max_runs "$run_count" "$change_count" "$success_count"
             print_countdown "$INTERVAL"
             continue
         fi
+        success_count=$((success_count + 1))
 
         # Detect mode on first successful response
         if [ -z "$resolved_mode" ]; then
@@ -1056,17 +1328,16 @@ main() {
             fi
         fi
 
-        check_max_runs "$run_count" "$change_count"
-
         # Single run mode
         if [ "$ONCE" = true ]; then
-            # A minor change (below threshold) still becomes the new baseline
-            persist_baseline "$current_content"
+            # Keep the baseline on minor changes so drift accumulates across runs.
             if [ "$change_count" -gt 0 ]; then
                 exit 2  # Exit code 2 = change detected
             fi
             exit 0
         fi
+
+        check_max_runs "$run_count" "$change_count" "$success_count"
 
         # Countdown
         print_countdown "$INTERVAL"

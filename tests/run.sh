@@ -9,7 +9,8 @@
 #
 #  Every test runs under each shell in $WW_TEST_SHELLS (default: bash from
 #  PATH plus /bin/bash when it is a different binary) and each locale in
-#  $WW_TEST_LOCALES (default: C).
+#  $WW_TEST_LOCALES (default: C fr_FR.UTF-8; missing fr_FR.UTF-8 is fatal).
+#  Set WW_TEST_LOCALES=C to explicitly run without the decimal-comma locale.
 # ==============================================================================
 
 set -u
@@ -84,11 +85,11 @@ if [ -z "${WW_TEST_SHELLS:-}" ]; then
 fi
 if [ -z "${WW_TEST_LOCALES:-}" ]; then
     # A locale with a decimal comma catches number-formatting bugs (awk/printf).
-    WW_TEST_LOCALES="C"
     if locale -a 2>/dev/null | grep -qi '^fr_FR\.utf-\{0,1\}8$'; then
         WW_TEST_LOCALES="C fr_FR.UTF-8"
     else
-        echo "WARN: locale fr_FR.UTF-8 not installed, decimal-comma tests skipped" >&2
+        echo "FATAL: locale fr_FR.UTF-8 not installed; set WW_TEST_LOCALES=C to explicitly skip decimal-comma tests" >&2
+        exit 1
     fi
 fi
 
@@ -133,6 +134,18 @@ assert_not_contains() {
 }
 
 # --- Helpers ------------------------------------------------------------------
+
+# Extract and call a pure script.sh function without HTTP, in a subshell under
+# the current shell/locale so unit tests exercise the same matrix as ww.
+ww_fn() {
+    local fn="$1" body
+    shift
+    # A plain assignment on purpose: bash 3.2 (the harness shell on macOS
+    # runners) mis-parses a $( ) containing "()" when it is itself nested
+    # inside a double-quoted argument, and brace-expands "{" there too.
+    body=$(sed -n "/^$fn() [{]/,/^[}]/p" "$SCRIPT")
+    LC_ALL="$LOC" "$SH" -c 'set -euo pipefail; eval "$1"; shift; "$@"' ww_fn "$body" "$fn" "$@"
+}
 
 # Run script.sh under the current shell/locale; sets OUT (stdout+stderr) and RC.
 # Killed after $WW_TEST_TIMEOUT seconds (RC=124) so a runaway loop fails
@@ -188,7 +201,7 @@ last_hook() {
     local latest
     latest=$(ls "$HOOKS"/*.json 2>/dev/null | tail -1)
     [ -n "$latest" ] || return 1
-    python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))[sys.argv[2]])' "$latest" "$1"
+    "$PYTHON" -c 'import json,sys; print(json.load(open(sys.argv[1]))[sys.argv[2]])' "$latest" "$1"
 }
 
 # 0 if the last recorded webhook body is valid JSON.
@@ -196,7 +209,7 @@ last_hook_body_is_json() {
     local latest
     latest=$(ls "$HOOKS"/*.json 2>/dev/null | tail -1)
     [ -n "$latest" ] || return 1
-    python3 -c 'import json,sys; json.loads(json.load(open(sys.argv[1]))["body"])' "$latest" 2>/dev/null
+    "$PYTHON" -c 'import json,sys; json.loads(json.load(open(sys.argv[1]))["body"])' "$latest" 2>/dev/null
 }
 
 reset_fixtures() {
@@ -212,6 +225,8 @@ t_help_shows_usage() {
     assert_contains "$OUT" "Usage:"
     assert_contains "$OUT" "--once"
     assert_contains "$OUT" "--baseline-file"
+    assert_contains "$OUT" "--ignore"
+    assert_contains "$OUT" "--full-page"
 }
 
 t_missing_url_fails() {
@@ -269,6 +284,17 @@ t_once_detects_change_and_updates_baseline() {
     assert_eq "$(cat "$TMP/baseline")" "$(cat "$SERVE/a.json")"
 }
 
+t_once_with_max_runs_keeps_exit_code() {
+    ww --once -n 1 --baseline-file "$TMP/baseline" "$BASE/a.json"
+    assert_rc 0
+
+    sed 's/"price": 10/"price": 12/' "$FIXTURES/a.json" > "$SERVE/a.json"
+    ww --once -n 1 --baseline-file "$TMP/baseline" "$BASE/a.json"
+    assert_rc 2
+    assert_contains "$OUT" "CHANGE DETECTED"
+    assert_eq "$(cat "$TMP/baseline")" "$(cat "$SERVE/a.json")"
+}
+
 t_once_no_change_exits_zero() {
     ww --once --baseline-file "$TMP/baseline" "$BASE/a.json"
     ww --once --baseline-file "$TMP/baseline" "$BASE/a.json"
@@ -291,6 +317,26 @@ t_threshold_minor_change_not_notified() {
     assert_rc 0
     assert_contains "$OUT" "Minor change (9.09% < 50% threshold)"
     assert_not_contains "$OUT" "CHANGE DETECTED"
+}
+
+t_once_threshold_keeps_baseline_until_notified() {
+    ww --once --baseline-file "$TMP/baseline" "$BASE/a.json"
+    assert_rc 0
+
+    sed 's/"price": 10/"price": 12/' "$FIXTURES/a.json" > "$SERVE/a.json"
+    ww --once -p 50 --baseline-file "$TMP/baseline" "$BASE/a.json"
+    assert_rc 0
+    assert_contains "$OUT" "Minor change"
+    assert_eq "$(cat "$TMP/baseline")" "$(cat "$FIXTURES/a.json")"
+
+    ww --once -p 50 --baseline-file "$TMP/baseline" "$BASE/a.json"
+    assert_rc 0
+    assert_contains "$OUT" "Minor change"
+
+    printf '{"totally": "different"}\n' > "$SERVE/a.json"
+    ww --once -p 50 --baseline-file "$TMP/baseline" "$BASE/a.json"
+    assert_rc 2
+    assert_eq "$(cat "$TMP/baseline")" "$(cat "$SERVE/a.json")"
 }
 
 t_threshold_major_change_notified() {
@@ -321,14 +367,31 @@ t_max_runs_counts_failed_fetches() {
     # Port 1 refuses connections: every fetch fails, -n must still stop the loop.
     run_bg -i 1 -n 2 --retries 1 --retry-delay 0 http://127.0.0.1:1/
     wait_bg 8
-    assert_rc 0
+    assert_rc 1
     assert_contains "$OUT" "Reached max runs (2)"
+    assert_contains "$OUT" "No successful fetch in 2 runs"
 }
 
 t_retries_zero_rejected() {
     ww --retries 0 "$BASE/a.json"
     assert_rc 1
     assert_contains "$OUT" "--retries must be an integer >= 1"
+}
+
+t_huge_integer_option_rejected() {
+    ww -i 99999999999999999999 "$BASE/a.json"
+    assert_rc 1
+    assert_contains "$OUT" "--interval must be an integer >= 1"
+    assert_not_contains "$OUT" "integer expression expected"
+
+    ww -n 99999999999999999999 "$BASE/a.json"
+    assert_rc 1
+    assert_contains "$OUT" "--max-runs must be an integer >= 0"
+    assert_not_contains "$OUT" "integer expression expected"
+
+    ww --once -i 999999999 "$BASE/a.json"
+    assert_rc 0
+    assert_contains "$OUT" "Baseline captured"
 }
 
 t_non_integer_options_rejected() {
@@ -363,6 +426,309 @@ check_stripped_page() {
     assert_not_contains "$1" "&#x27;"
 }
 
+t_webindex_backend() {
+    if ! command -v webindex >/dev/null 2>&1; then
+        echo "  SKIP t_webindex_backend (webindex not installed)"
+        return
+    fi
+    ww --once -m website --baseline-file "$TMP/baseline" "$BASE/blocks.html"
+    assert_rc 0
+    assert_contains "$OUT" "Stripper:   webindex"
+    local text
+    text=$(cat "$TMP/baseline")
+    assert_contains "$text" "Title"
+    assert_contains "$text" "Item A"
+    assert_contains "$text" "Chocolate cookies: 10 EUR"
+    assert_contains "$text" "The General Data Privacy Regulation (GDPR) in the European Union"
+    assert_not_contains "$text" "NavWord"
+    assert_not_contains "$text" "Accept all cookies"
+
+    rm -f "$TMP/baseline"
+    ww --once -m website --full-page --baseline-file "$TMP/baseline" "$BASE/blocks.html"
+    assert_rc 0
+    assert_contains "$(cat "$TMP/baseline")" "NavWord"
+    assert_contains "$(cat "$TMP/baseline")" "Accept all cookies"
+}
+
+t_webindex_fallback_when_missing() {
+    mkdir -p "$TMP/shim" "$TMP/extract-tmp"
+    cat > "$TMP/shim/webindex" <<'EOF'
+#!/bin/sh
+echo 'partial failed extraction'
+echo 'unknown flag' >&2
+exit 2
+EOF
+    chmod +x "$TMP/shim/webindex"
+    local before after text
+    before=$(find "$TMP/extract-tmp" -name 'ww.*' | wc -l)
+    WW_HTML_STRIPPER=webindex PATH="$TMP/shim:$PATH" TMPDIR="$TMP/extract-tmp" \
+        ww --once -m website --baseline-file "$TMP/baseline" "$BASE/page.html"
+    assert_rc 0
+    assert_contains "$OUT" "[WARN] webindex extract failed (exit 2), falling back to perl"
+    text=$(cat "$TMP/baseline")
+    assert_contains "$text" "Hello"
+    assert_contains "$text" "Product"
+    assert_not_contains "$text" "partial failed extraction"
+    after=$(find "$TMP/extract-tmp" -name 'ww.*' | wc -l)
+    assert_eq "$after" "$before"
+
+    rm -f "$TMP/baseline"
+    WW_HTML_STRIPPER=webindex PATH="$TMP/shim:$PATH" TMPDIR="$TMP/extract-tmp" \
+        ww --once -m website --baseline-file "$TMP/baseline" "$BASE/blocks.html"
+    assert_rc 0
+    assert_not_contains "$(cat "$TMP/baseline")" "Accept all cookies"
+
+    rm -f "$TMP/baseline"
+    WW_HTML_STRIPPER=webindex PATH="$TMP/shim:$PATH" TMPDIR="$TMP/extract-tmp" \
+        ww --once -m website --full-page --baseline-file "$TMP/baseline" "$BASE/blocks.html"
+    assert_rc 0
+    assert_contains "$OUT" "[WARN] webindex extract failed"
+    assert_contains "$(cat "$TMP/baseline")" "NavWord"
+    assert_contains "$(cat "$TMP/baseline")" "Accept all cookies"
+    after=$(find "$TMP/extract-tmp" -name 'ww.*' | wc -l)
+    assert_eq "$after" "$before"
+    rm -f "$TMP/shim/webindex"
+}
+
+t_webindex_forced_when_present() {
+    if ! command -v webindex >/dev/null 2>&1; then
+        echo "  SKIP t_webindex_forced_when_present (webindex not installed)"
+        return
+    fi
+    WW_HTML_STRIPPER=webindex ww --once -m website --baseline-file "$TMP/baseline" "$BASE/blocks.html"
+    assert_rc 0
+    assert_contains "$OUT" "Stripper:   webindex"
+    assert_contains "$(cat "$TMP/baseline")" "# Title"
+}
+
+t_webindex_fallback_without_perl() {
+    mkdir -p "$TMP/nopath" "$TMP/extract-tmp"
+    local tool text
+    # Exercise a genuinely missing webindex and perl, keeping only the
+    # commands needed by the CLI (and the shell used by the test matrix).
+    for tool in bash curl sed grep awk tr cat mktemp rm mv date sleep diff wc mkdir jq; do
+        ln -sf "$(command -v "$tool")" "$TMP/nopath/$tool"
+    done
+    WW_HTML_STRIPPER=webindex PATH="$TMP/nopath" TMPDIR="$TMP/extract-tmp" \
+        ww --once -m website --baseline-file "$TMP/baseline" "$BASE/page.html"
+    assert_rc 0
+    assert_contains "$OUT" "[WARN] webindex extract failed (exit 127), falling back to sed"
+    text=$(cat "$TMP/baseline")
+    assert_contains "$text" "Hello"
+    assert_contains "$text" "Product"
+    assert_eq "$(find "$TMP/extract-tmp" -name 'ww.*' | wc -l | tr -d ' ')" "0"
+}
+
+t_verbose_does_not_pollute_baseline() {
+    ww --once -v -m website --baseline-file "$TMP/baseline" "$BASE/page.html"
+    assert_rc 0
+    local text
+    text=$(cat "$TMP/baseline")
+    assert_not_contains "$text" "[DEBUG]"
+    assert_not_contains "$text" "stripper"
+    assert_contains "$OUT" "[DEBUG] HTML stripper"
+}
+
+t_ignore_drops_lines_in_website_mode() {
+    ww --once -m website --ignore 'ago|points' --baseline-file "$TMP/baseline" "$BASE/blocks.html"
+    assert_rc 0
+    local text
+    text=$(cat "$TMP/baseline")
+    assert_not_contains "$text" "minutes ago"
+    assert_contains "$text" "Item A"
+}
+
+t_ignore_applies_in_api_mode() {
+    ww --once --ignore '"rating"' --baseline-file "$TMP/baseline" "$BASE/a.json"
+    assert_rc 0
+    local text
+    text=$(cat "$TMP/baseline")
+    assert_not_contains "$text" "rating"
+    assert_contains "$text" '"price": 10'
+}
+
+t_ignore_applies_when_jq_fails() {
+    ww --once -f '.[' --ignore '"rating"' --baseline-file "$TMP/baseline" "$BASE/a.json"
+    assert_rc 0
+    assert_contains "$OUT" "jq filter failed"
+    local text
+    text=$(cat "$TMP/baseline")
+    assert_not_contains "$text" "rating"
+    assert_contains "$text" "price"
+}
+
+t_ignore_changes_not_notified() {
+    ww --once -m website --ignore 'ago' --baseline-file "$TMP/baseline" "$BASE/blocks.html"
+    assert_rc 0
+    sed 's/posted 3 minutes ago/posted 9 minutes ago/' "$FIXTURES/blocks.html" > "$SERVE/blocks.html"
+    ww --once -m website --ignore 'ago' --baseline-file "$TMP/baseline" "$BASE/blocks.html"
+    assert_rc 0
+    assert_contains "$OUT" "No change"
+
+    sed -e 's/posted 3 minutes ago/posted 9 minutes ago/' -e 's/Item A/Item Z/' "$FIXTURES/blocks.html" > "$SERVE/blocks.html"
+    ww --once -m website --ignore 'ago' --baseline-file "$TMP/baseline" "$BASE/blocks.html"
+    assert_rc 2
+}
+
+t_ignore_shown_in_config() {
+    ww --once --ignore a --ignore b "$BASE/a.json"
+    assert_rc 0
+    assert_contains "$OUT" "Ignore:     2 pattern(s)"
+}
+
+t_ignore_applies_when_selector_not_found() {
+    ww --once -m website -s 'missing-selector' --ignore 'ago' --baseline-file "$TMP/baseline" "$BASE/blocks.html"
+    assert_rc 0
+    assert_contains "$OUT" "Selector pattern not found"
+    local text
+    text=$(cat "$TMP/baseline")
+    assert_not_contains "$text" "minutes ago"
+    assert_contains "$text" "Item A"
+    # The selector fallback still returns HTML, without later stripping.
+    assert_contains "$text" "<html>"
+}
+
+t_ignore_multiple_patterns_keep_non_utf8_content() {
+    printf 'abc\377\376def\ndrop one\n-drop two\nKeep\n' > "$SERVE/bin.dat"
+    ww --once --ignore '^drop' --ignore '-drop' --baseline-file "$TMP/baseline" "$BASE/bin.dat"
+    assert_rc 0
+    assert_eq "$(cat "$TMP/baseline")" "$(printf 'abc\377\376def\nKeep')"
+}
+
+t_ignore_invalid_regex_rejected() {
+    printf 'Existing baseline\n' > "$TMP/baseline"
+    cp "$TMP/baseline" "$TMP/baseline.before"
+    ww --once --ignore '[' --baseline-file "$TMP/baseline" "$BASE/a.json"
+    assert_rc 1
+    assert_contains "$OUT" "invalid regular expression"
+    if cmp -s "$TMP/baseline.before" "$TMP/baseline"; then pass; else fail "baseline changed"; fi
+}
+
+t_ignore_filter_failure_preserves_baseline() {
+    mkdir -p "$TMP/shim"
+    local real_grep
+    real_grep=$(command -v grep)
+    cat > "$TMP/shim/grep" <<'EOF'
+#!/bin/sh
+if [ "$1" = -avE ]; then exit 2; fi
+exec "$WW_REAL_GREP" "$@"
+EOF
+    chmod +x "$TMP/shim/grep"
+    printf 'Existing baseline\n' > "$TMP/baseline"
+    cp "$TMP/baseline" "$TMP/baseline.before"
+    WW_REAL_GREP="$real_grep" PATH="$TMP/shim:$PATH" \
+        ww --once --ignore 'rating' --baseline-file "$TMP/baseline" "$BASE/a.json"
+    assert_rc 1
+    assert_contains "$OUT" "ignore filter failed (grep exit 2)"
+    if cmp -s "$TMP/baseline.before" "$TMP/baseline"; then pass; else fail "baseline changed"; fi
+    rm -f "$TMP/shim/grep"
+}
+
+t_ignore_can_drop_all_lines() {
+    ww --once --ignore '.*' --baseline-file "$TMP/baseline" "$BASE/a.json"
+    assert_rc 0
+    assert_eq "$(cat "$TMP/baseline")" ""
+    ww --once --ignore '.*' --baseline-file "$TMP/baseline" "$BASE/a.json"
+    assert_rc 0
+    assert_contains "$OUT" "No change"
+}
+
+t_website_mode_one_line_per_block() {
+    # This exact plain-heading format belongs to the legacy stripper.
+    WW_HTML_STRIPPER=perl ww --once -m website --baseline-file "$TMP/baseline" "$BASE/page.html"
+    assert_rc 0
+    local expected
+    expected=$(cat <<'EOF'
+Hello
+Price: 10 € © 'quoted'
+Product
+Visible
+EOF
+)
+    assert_eq "$(cat "$TMP/baseline")" "$expected"
+}
+
+t_consent_filter_keeps_prose_mentioning_cookies() {
+    local stripper text
+    for stripper in perl sed; do
+        rm -f "$TMP/baseline"
+        WW_HTML_STRIPPER="$stripper" ww --once -m website --baseline-file "$TMP/baseline" "$BASE/blocks.html"
+        assert_rc 0
+        text=$(cat "$TMP/baseline")
+        assert_contains "$text" "Chocolate cookies: 10 EUR"
+        assert_contains "$text" "The General Data Privacy Regulation (GDPR) in the European Union"
+        assert_not_contains "$text" "Accept all cookies"
+    done
+}
+
+t_chrome_blocks_removed_by_default() {
+    # Legacy stripping removes every header/aside; webindex isolates main
+    # content using its own policy (covered by t_webindex_backend).
+    WW_HTML_STRIPPER="${WW_HTML_STRIPPER:-perl}" ww --once -m website --baseline-file "$TMP/baseline" "$BASE/blocks.html"
+    assert_rc 0
+    assert_contains "$OUT" "Page:       main content (use --full-page to keep chrome)"
+    local text
+    text=$(cat "$TMP/baseline")
+    assert_contains "$text" "Title"
+    assert_contains "$text" "Item A"
+    assert_not_contains "$text" "NavWord"
+    assert_not_contains "$text" "HeaderWord"
+    assert_not_contains "$text" "FooterWord"
+    assert_not_contains "$text" "AsideWord"
+    assert_contains "$text" "Chocolate cookies: 10 EUR"
+    assert_contains "$text" "The General Data Privacy Regulation (GDPR) in the European Union"
+    assert_not_contains "$text" "Accept all cookies"
+}
+
+t_full_page_keeps_chrome() {
+    ww --once -m website --full-page --baseline-file "$TMP/baseline" "$BASE/blocks.html"
+    assert_rc 0
+    assert_contains "$OUT" "Page:       full page"
+    local text
+    text=$(cat "$TMP/baseline")
+    assert_contains "$text" "Title"
+    assert_contains "$text" "Item A"
+    assert_contains "$text" "NavWord"
+    assert_contains "$text" "HeaderWord"
+    assert_contains "$text" "FooterWord"
+    assert_contains "$text" "AsideWord"
+    assert_contains "$text" "Accept all cookies"
+}
+
+t_sed_fallback_chrome_blocks_removed_by_default() {
+    WW_HTML_STRIPPER="sed" t_chrome_blocks_removed_by_default
+}
+
+t_sed_fallback_full_page_keeps_chrome() {
+    WW_HTML_STRIPPER="sed" t_full_page_keeps_chrome
+}
+
+t_website_mode_blocks_fixture() {
+    # Shared legacy expectation; the sed wrapper can still select sed.
+    WW_HTML_STRIPPER="${WW_HTML_STRIPPER:-perl}" ww --once -m website --baseline-file "$TMP/baseline" "$BASE/blocks.html"
+    assert_rc 0
+    local expected
+    expected=$(cat <<'EOF'
+Title
+Paragraph one continues here and ends.
+Item A
+Item B
+second line
+Row 1 Cell A
+Row 1 Cell B
+Row 2 Cell A
+Row 2 Cell B
+posted 3 minutes ago
+See the link now
+Chocolate cookies: 10 EUR
+The General Data Privacy Regulation (GDPR) in the European Union
+EOF
+)
+    assert_eq "$(cat "$TMP/baseline")" "$expected"
+    assert_eq "$(LC_ALL=C grep -c "$(printf '\t')" "$TMP/baseline")" "0"
+    assert_eq "$(LC_ALL=C grep -c '^ \| $' "$TMP/baseline")" "0"
+}
+
 t_website_mode_strips_scripts_styles_and_tags() {
     ww --once -m website --baseline-file "$TMP/baseline" "$BASE/page.html"
     assert_rc 0
@@ -386,10 +752,151 @@ t_website_mode_strips_tags_with_quoted_angle_brackets() {
     assert_not_contains "$text" "meta"
 }
 
+t_perl_stripper_script_containing_comment_opener() {
+    WW_HTML_STRIPPER=perl ww --once -m website --baseline-file "$TMP/baseline" "$BASE/tricky.html"
+    assert_rc 0
+    local text
+    text=$(cat "$TMP/baseline")
+    assert_contains "$text" "Price"
+    assert_contains "$text" "Important"
+    assert_contains "$text" "Tail"
+    assert_not_contains "$text" "x()"
+    assert_not_contains "$text" "<!--"
+    assert_not_contains "$(tr '\n' ' ' < "$TMP/baseline")" "1 < 2"
+}
+
+t_entities_decoded_once() {
+    # Perl preserves invalid numeric entities; webindex replaces them.
+    WW_HTML_STRIPPER=perl ww --once -m website --baseline-file "$TMP/baseline" "$BASE/tricky.html"
+    assert_rc 0
+    local text
+    text=$(cat "$TMP/baseline")
+    assert_contains "$text" "&lt;"
+    assert_contains "$(tr '\n' ' ' < "$TMP/baseline")" "Price: 5 &lt; 10"
+    assert_not_contains "$(tr '\n' ' ' < "$TMP/baseline")" "Price: 5 < 10"
+    assert_contains "$text" "$(printf '\360\237\230\200')"
+    assert_contains "$text" "&#1114112;"
+    assert_contains "$text" "&#xD800;"
+    assert_contains "$text" "&#57343;"
+}
+
 t_website_mode_sed_fallback_strips_scripts_styles_and_tags() {
     WW_HTML_STRIPPER="sed" ww --once -m website --baseline-file "$TMP/baseline" "$BASE/page.html"
     assert_rc 0
     check_stripped_page "$(cat "$TMP/baseline")"
+}
+
+t_sed_fallback_one_line_per_block() {
+    # The fallback decoder supports &copy;, but not arbitrary numeric entities.
+    sed 's/&#169;/\&copy;/g' "$FIXTURES/page.html" > "$SERVE/page.html"
+    WW_HTML_STRIPPER="sed" ww --once -m website --baseline-file "$TMP/baseline" "$BASE/page.html"
+    assert_rc 0
+    local expected
+    expected=$(cat <<'EOF'
+Hello
+Price: 10 € © 'quoted'
+Product
+Visible
+EOF
+)
+    assert_eq "$(cat "$TMP/baseline")" "$expected"
+}
+
+t_sed_fallback_unclosed_comment_keeps_text() {
+    WW_HTML_STRIPPER="sed" ww --once -m website --baseline-file "$TMP/baseline" "$BASE/tricky.html"
+    assert_rc 0
+    local text
+    text=$(cat "$TMP/baseline")
+    assert_contains "$text" "Tail"
+    assert_not_contains "$text" "<!--"
+}
+
+t_sed_fallback_self_closing_svg_keeps_content() {
+    printf '%s\n' '<p>Before</p><svg viewBox="0 0 10 10"/><p>Stock: 4</p>' > "$SERVE/svg.html"
+    local stripper text
+    for stripper in sed perl; do
+        rm -f "$TMP/baseline"
+        WW_HTML_STRIPPER="$stripper" ww --once -m website --baseline-file "$TMP/baseline" "$BASE/svg.html"
+        assert_rc 0
+        text=$(cat "$TMP/baseline")
+        assert_contains "$text" "Before"
+        assert_contains "$text" "Stock: 4"
+    done
+}
+
+t_omitted_head_end_tag_keeps_body() {
+    printf '%s\n' '<!doctype html><html><head><title>Store</title><body><p>Stock: 4</p></body></html>' > "$SERVE/head.html"
+    local stripper text
+    for stripper in perl sed; do
+        rm -f "$TMP/baseline"
+        WW_HTML_STRIPPER="$stripper" ww --once -m website --baseline-file "$TMP/baseline" "$BASE/head.html"
+        assert_rc 0
+        text=$(cat "$TMP/baseline")
+        assert_contains "$text" "Stock: 4"
+        assert_not_contains "$text" "Store"
+    done
+}
+
+t_sed_fallback_blocks_fixture() {
+    WW_HTML_STRIPPER="sed" t_website_mode_blocks_fixture
+}
+
+t_sed_fallback_record_and_window_boundaries() {
+    # Move each delimiter through a window edge; quoted tags, comments and
+    # raw closing tags must also keep their state across input records.
+    "$PYTHON" - "$SERVE/boundaries.html" <<'PY'
+import sys
+with open(sys.argv[1], "wb") as page:
+    for padding in range(4070, 4100):
+        page.write(b' ' * padding + b'<p>1 < 2 <a\n title="a > b">Caf\xe9</a>\n'
+                   b'continues</p><!--' + b'x' * padding + b'-->\n'
+                   b'<ScRiPt>' + b'x' * padding + b'</sCrIpT\n>\n'
+                   b'<div data-note=\'' + b'x' * padding + b'>\nquoted\'>Tail</div>\n')
+PY
+    WW_HTML_STRIPPER="sed" ww --once -m website --baseline-file "$TMP/baseline" "$BASE/boundaries.html"
+    assert_rc 0
+    local expected i
+    expected=$(
+        i=0
+        while [ "$i" -lt 30 ]; do
+            printf '1 < 2 Caf\351 continues\nTail\n'
+            i=$((i + 1))
+        done
+    )
+    assert_eq "$(cat "$TMP/baseline")" "$expected"
+}
+
+t_sed_fallback_script_with_comment_opener() {
+    WW_HTML_STRIPPER="sed" ww --once -m website --baseline-file "$TMP/baseline" "$BASE/tricky.html"
+    assert_rc 0
+    local text
+    text=$(cat "$TMP/baseline")
+    assert_contains "$text" "Price"
+    assert_contains "$text" "Important"
+    assert_not_contains "$text" "x()"
+    assert_not_contains "$(tr '\n' ' ' < "$TMP/baseline")" "1 < 2"
+}
+
+t_sed_fallback_is_linear_on_large_page() {
+    # One long record also catches repeated copying/scanning of its suffix.
+    "$PYTHON" - "$SERVE/big.html" <<'PY'
+import sys
+with open(sys.argv[1], "w") as page:
+    for n in range(20000):
+        page.write('<div class="row"><a href="/i/{0}">Item {0}</a> '
+                   '<script>var x = {0};</script><p>Text {0} &amp; more</p></div>'.format(n))
+    page.write('\n')
+PY
+    local start elapsed text
+    start=$(date +%s)
+    WW_HTML_STRIPPER="sed" WW_TEST_TIMEOUT=60 ww --once -m website --baseline-file "$TMP/baseline" "$BASE/big.html"
+    elapsed=$(($(date +%s) - start))
+    assert_rc 0
+    text=$(cat "$TMP/baseline")
+    assert_contains "$text" "Item 19999"
+    assert_not_contains "$text" "var x"
+    printf '  Large sed page [%s | %s]: %s s\n' "$SH" "$LOC" "$elapsed"
+    if [ "$elapsed" -lt 15 ]; then pass; else fail "large sed page took ${elapsed}s (expected < 15s)"; fi
 }
 
 t_website_mode_ignores_script_only_changes() {
@@ -406,6 +913,32 @@ trigger_change() {
     ww --once --baseline-file "$TMP/baseline" "$@"
     sed 's/"price": 10/"price": 12/' "$FIXTURES/a.json" > "$SERVE/a.json"
     ww --once --baseline-file "$TMP/baseline" "$@"
+}
+
+t_json_escape_control_chars() {
+    local input escaped
+    input=$(printf 'a\033b\010c\001d\ttab\nnl"q\\bs')
+    escaped=$(ww_fn json_escape "$input")
+    if printf '%s' "$escaped" | "$PYTHON" -c '
+import json,sys
+v = json.loads(sys.stdin.read())
+assert v == sys.argv[1], repr(v)
+' "$input"; then pass; else fail "control characters did not round-trip through JSON"; fi
+    assert_contains "$escaped" '\u001b'
+    assert_contains "$escaped" '\u0008'
+
+    # Include every non-NUL C0 character, with a suffix to preserve newlines.
+    input=$(printf '\001\002\003\004\005\006\007\010\011\012\013\014\015\016\017\020\021\022\023\024\025\026\027\030\031\032\033\034\035\036\037end')
+    escaped=$(ww_fn json_escape "$input")
+    if printf '%s' "$escaped" | "$PYTHON" -c '
+import json,sys
+v = json.loads(sys.stdin.read())
+assert v == sys.argv[1], repr(v)
+' "$input"; then pass; else fail "full C0 range did not round-trip through JSON"; fi
+
+    # High bytes must remain untouched, even when invalid in the active locale.
+    input=$(printf '\200\303\251\377')
+    assert_eq "$(ww_fn json_escape "$input")" "\"$input\""
 }
 
 t_slack_webhook_sends_valid_json() {
@@ -447,7 +980,7 @@ t_telegram_sends_full_message_urlencoded() {
     assert_eq "$(hook_count)" "1"
     assert_contains "$(last_hook path)" "/bot123:abc/sendMessage"
     local text
-    text=$(python3 -c 'import sys,urllib.parse; q=urllib.parse.parse_qs(sys.stdin.read()); print(q["chat_id"][0]); print(q["text"][0])' <<< "$(last_hook body)")
+    text=$("$PYTHON" -c 'import sys,urllib.parse; q=urllib.parse.parse_qs(sys.stdin.read()); print(q["chat_id"][0]); print(q["text"][0])' <<< "$(last_hook body)")
     assert_contains "$text" "42"
     assert_contains "$text" "Change Detected"
     assert_contains "$text" "a.json?x=1&y=my_value"
