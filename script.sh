@@ -328,11 +328,11 @@ check_dependencies() {
 
 # --- Argument Parsing ---
 
-# require_int <option> <value> <min> — exit 1 unless value is an integer >= min
+# require_int <option> <value> <min> — require an integer >= min, at most 9 digits
 require_int() {
     local option="$1" value="$2" min="$3"
-    if ! [[ "$value" =~ ^[0-9]+$ ]] || [ "$value" -lt "$min" ]; then
-        log_error "$option must be an integer >= $min (got '$value')"
+    if ! [[ "$value" =~ ^[0-9]{1,9}$ ]] || [ "$value" -lt "$min" ]; then
+        log_error "$option must be an integer >= $min (at most 9 digits) (got '$value')"
         exit 1
     fi
 }

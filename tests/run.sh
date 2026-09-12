@@ -332,6 +332,22 @@ t_retries_zero_rejected() {
     assert_contains "$OUT" "--retries must be an integer >= 1"
 }
 
+t_huge_integer_option_rejected() {
+    ww -i 99999999999999999999 "$BASE/a.json"
+    assert_rc 1
+    assert_contains "$OUT" "--interval must be an integer >= 1"
+    assert_not_contains "$OUT" "integer expression expected"
+
+    ww -n 99999999999999999999 "$BASE/a.json"
+    assert_rc 1
+    assert_contains "$OUT" "--max-runs must be an integer >= 0"
+    assert_not_contains "$OUT" "integer expression expected"
+
+    ww --once -i 999999999 "$BASE/a.json"
+    assert_rc 0
+    assert_contains "$OUT" "Baseline captured"
+}
+
 t_non_integer_options_rejected() {
     ww --retries abc "$BASE/a.json"
     assert_rc 1
