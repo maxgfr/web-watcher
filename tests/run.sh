@@ -533,6 +533,93 @@ t_website_mode_sed_fallback_strips_scripts_styles_and_tags() {
     check_stripped_page "$(cat "$TMP/baseline")"
 }
 
+t_sed_fallback_one_line_per_block() {
+    # The fallback decoder supports &copy;, but not arbitrary numeric entities.
+    sed 's/&#169;/\&copy;/g' "$FIXTURES/page.html" > "$SERVE/page.html"
+    WW_HTML_STRIPPER="sed" ww --once -m website --baseline-file "$TMP/baseline" "$BASE/page.html"
+    assert_rc 0
+    local expected
+    expected=$(cat <<'EOF'
+Hello
+Price: 10 € © 'quoted'
+Product
+Visible
+EOF
+)
+    assert_eq "$(cat "$TMP/baseline")" "$expected"
+}
+
+t_sed_fallback_unclosed_comment_keeps_text() {
+    WW_HTML_STRIPPER="sed" ww --once -m website --baseline-file "$TMP/baseline" "$BASE/tricky.html"
+    assert_rc 0
+    local text
+    text=$(cat "$TMP/baseline")
+    assert_contains "$text" "Tail"
+    assert_not_contains "$text" "<!--"
+}
+
+t_sed_fallback_blocks_fixture() {
+    WW_HTML_STRIPPER="sed" WW_FULL_PAGE=true t_website_mode_blocks_fixture
+}
+
+t_sed_fallback_record_and_window_boundaries() {
+    # Move each delimiter through a window edge; quoted tags, comments and
+    # raw closing tags must also keep their state across input records.
+    "$PYTHON" - "$SERVE/boundaries.html" <<'PY'
+import sys
+with open(sys.argv[1], "wb") as page:
+    for padding in range(4070, 4100):
+        page.write(b' ' * padding + b'<p>1 < 2 <a\n title="a > b">Caf\xe9</a>\n'
+                   b'continues</p><!--' + b'x' * padding + b'-->\n'
+                   b'<ScRiPt>' + b'x' * padding + b'</sCrIpT\n>\n'
+                   b'<div data-note=\'' + b'x' * padding + b'>\nquoted\'>Tail</div>\n')
+PY
+    WW_HTML_STRIPPER="sed" ww --once -m website --baseline-file "$TMP/baseline" "$BASE/boundaries.html"
+    assert_rc 0
+    local expected i
+    expected=$(
+        i=0
+        while [ "$i" -lt 30 ]; do
+            printf '1 < 2 Caf\351 continues\nTail\n'
+            i=$((i + 1))
+        done
+    )
+    assert_eq "$(cat "$TMP/baseline")" "$expected"
+}
+
+t_sed_fallback_script_with_comment_opener() {
+    WW_HTML_STRIPPER="sed" ww --once -m website --baseline-file "$TMP/baseline" "$BASE/tricky.html"
+    assert_rc 0
+    local text
+    text=$(cat "$TMP/baseline")
+    assert_contains "$text" "Price"
+    assert_contains "$text" "Important"
+    assert_not_contains "$text" "x()"
+    assert_not_contains "$(tr '\n' ' ' < "$TMP/baseline")" "1 < 2"
+}
+
+t_sed_fallback_is_linear_on_large_page() {
+    # One long record also catches repeated copying/scanning of its suffix.
+    "$PYTHON" - "$SERVE/big.html" <<'PY'
+import sys
+with open(sys.argv[1], "w") as page:
+    for n in range(20000):
+        page.write('<div class="row"><a href="/i/{0}">Item {0}</a> '
+                   '<script>var x = {0};</script><p>Text {0} &amp; more</p></div>'.format(n))
+    page.write('\n')
+PY
+    local start elapsed text
+    start=$(date +%s)
+    WW_HTML_STRIPPER="sed" WW_TEST_TIMEOUT=60 ww --once -m website --baseline-file "$TMP/baseline" "$BASE/big.html"
+    elapsed=$(($(date +%s) - start))
+    assert_rc 0
+    text=$(cat "$TMP/baseline")
+    assert_contains "$text" "Item 19999"
+    assert_not_contains "$text" "var x"
+    printf '  Large sed page [%s | %s]: %s s\n' "$SH" "$LOC" "$elapsed"
+    if [ "$elapsed" -lt 15 ]; then pass; else fail "large sed page took ${elapsed}s (expected < 15s)"; fi
+}
+
 t_website_mode_ignores_script_only_changes() {
     ww --once -m website --baseline-file "$TMP/baseline" "$BASE/page.html"
     sed 's/abc123/zzz999/' "$FIXTURES/page.html" > "$SERVE/page.html"

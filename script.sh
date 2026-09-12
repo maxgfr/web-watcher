@@ -682,17 +682,114 @@ strip_html_tags_perl() {
     '
 }
 
-# sed/awk fallback: join the document on one line, then put every tag on its
-# own line so line-range deletes can drop comments and script/style blocks
-# even when their content contains "<". Named entities only.
+# Streaming, byte-oriented awk fallback: skip comments/raw blocks in opening
+# order, scan quoted tags, and separate blocks. Use the limited sed entity
+# decoder; the caller normalizes each output line. Search windows stay bounded
+# so even a minified document does not repeatedly copy/lowercase its suffix.
 strip_html_tags_sed() {
-    tr '\n' ' ' |
-    awk '{ gsub(/</, "\n<"); gsub(/>/, ">\n"); print }' |
-    sed -e '/^<!--.*-->$/d' \
-        -e '/^<!--/,/-->$/d' \
-        -e '/^<[Ss][Cc][Rr][Ii][Pp][Tt]/,/^<\/[Ss][Cc][Rr][Ii][Pp][Tt]/d' \
-        -e '/^<[Ss][Tt][Yy][Ll][Ee]/,/^<\/[Ss][Tt][Yy][Ll][Ee]/d' \
-        -e '/^<[^>]*>$/d' |
+    awk -v full="$( [ "${WW_FULL_PAGE:-false}" = true ] && echo 1 || echo 0 )" '
+        BEGIN { state = "TEXT" }
+        {
+            size = length($0)
+            offset = 1
+            while (offset <= size) {
+                window = substr($0, offset, 4096)
+                limit = length(window)
+                # Keep lookahead for TEXT classification and skipped delimiters.
+                if (offset + limit <= size) limit -= 16
+                pos = 1
+                while (pos <= limit) {
+                    rest = substr(window, pos)
+                    width = length(rest)
+                    if (state == "TEXT") {
+                        at = index(rest, "<")
+                        if (!at) {
+                            printf "%s", rest
+                            pos += width
+                            continue
+                        }
+                        if (pos + at - 1 > limit) {
+                            printf "%s", substr(rest, 1, limit - pos + 1)
+                            pos = limit + 1
+                            continue
+                        }
+                        printf "%s", substr(rest, 1, at - 1)
+                        pos += at - 1
+                        # Look ahead in the record, including across a window edge.
+                        if (substr(window, pos, 4) == "<!--") {
+                            state = "COMMENT"
+                            pos += 4
+                            printf " "
+                        } else if (substr(window, pos + 1, 1) ~ /^[a-zA-Z\/!?]$/) {
+                            state = "TAG"
+                            closing = (substr(window, pos + 1, 1) == "/")
+                            pos += 1 + closing
+                            name = quote = ""
+                            naming = 1
+                        } else {
+                            printf "<"
+                            pos++
+                        }
+                    } else if (state == "TAG") {
+                        for (i = 1; i <= width; i++) {
+                            c = substr(rest, i, 1)
+                            if (quote != "") {
+                                if (c == quote) quote = ""
+                            } else if (c == "\"" || c == "'"'"'") {
+                                quote = c
+                                naming = 0
+                            } else if (c == ">") {
+                                state = "TEXT"
+                                if (!closing && (name ~ /^(script|style|noscript|svg|template|head|title)$/ ||
+                                    (full != 1 && name ~ /^(nav|header|footer|aside)$/))) {
+                                    state = "RAW"
+                                    raw_close = "</" name
+                                    raw_end = 0
+                                    printf " "
+                                } else if (name ~ /^(p|div|section|article|main|li|tr|td|th|ul|ol|dl|dt|dd|h[1-6]|pre|blockquote|table|br|hr|form|figure|option)$/) {
+                                    printf "\n"
+                                } else {
+                                    printf " "
+                                }
+                                i++
+                                break
+                            } else if (c ~ /^[[:space:]\/]$/) {
+                                naming = 0
+                            } else if (naming && length(name) <= 10) {
+                                # No recognized name exceeds ten bytes. Cap unknown
+                                # names too, avoiding growing-string concatenation.
+                                name = name tolower(c)
+                            }
+                        }
+                        pos += i - 1
+                    } else {
+                        # COMMENT and RAW skip chunks with index(), never per byte.
+                        needle = (state == "COMMENT" ? "-->" : (raw_end ? ">" : raw_close))
+                        at = index(state == "RAW" && !raw_end ? tolower(rest) : rest, needle)
+                        if (at) {
+                            pos += at - 1 + length(needle)
+                            if (state == "RAW" && !raw_end) {
+                                raw_end = 1
+                            } else {
+                                state = "TEXT"
+                                printf " "
+                            }
+                        } else if (offset + pos + width - 1 <= size) {
+                            # Retain enough overlap for a delimiter crossing windows.
+                            pos += width - length(needle) + 1
+                        } else {
+                            pos += width
+                        }
+                    }
+                }
+                offset += pos - 1
+            }
+            if (state == "TEXT") printf " "
+            # A record separator is whitespace, including inside an open tag.
+            if (state == "TAG") naming = 0
+        }
+        END { printf "\n" }
+    ' |
     decode_html_entities
 }
 
