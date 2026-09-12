@@ -222,6 +222,7 @@ Webhook calls fail loudly: an HTTP error from Slack, Discord or Telegram is repo
 ```
 
 The `--baseline-file` flag persists the previous response to disk so `--once` can compare across cron runs.
+With a threshold, a minor change below it does not replace the stored baseline, so drift accumulates until it crosses the threshold, exactly as in continuous mode.
 
 Exit codes for `--once` mode:
 - `0` — No change detected (or first run)

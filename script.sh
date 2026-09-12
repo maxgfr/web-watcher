@@ -1074,8 +1074,7 @@ main() {
 
         # Single run mode
         if [ "$ONCE" = true ]; then
-            # A minor change (below threshold) still becomes the new baseline
-            persist_baseline "$current_content"
+            # Keep the baseline on minor changes so drift accumulates across runs.
             if [ "$change_count" -gt 0 ]; then
                 exit 2  # Exit code 2 = change detected
             fi

@@ -318,6 +318,26 @@ t_threshold_minor_change_not_notified() {
     assert_not_contains "$OUT" "CHANGE DETECTED"
 }
 
+t_once_threshold_keeps_baseline_until_notified() {
+    ww --once --baseline-file "$TMP/baseline" "$BASE/a.json"
+    assert_rc 0
+
+    sed 's/"price": 10/"price": 12/' "$FIXTURES/a.json" > "$SERVE/a.json"
+    ww --once -p 50 --baseline-file "$TMP/baseline" "$BASE/a.json"
+    assert_rc 0
+    assert_contains "$OUT" "Minor change"
+    assert_eq "$(cat "$TMP/baseline")" "$(cat "$FIXTURES/a.json")"
+
+    ww --once -p 50 --baseline-file "$TMP/baseline" "$BASE/a.json"
+    assert_rc 0
+    assert_contains "$OUT" "Minor change"
+
+    printf '{"totally": "different"}\n' > "$SERVE/a.json"
+    ww --once -p 50 --baseline-file "$TMP/baseline" "$BASE/a.json"
+    assert_rc 2
+    assert_eq "$(cat "$TMP/baseline")" "$(cat "$SERVE/a.json")"
+}
+
 t_threshold_major_change_notified() {
     ww --once --baseline-file "$TMP/baseline" "$BASE/a.json"
     printf '{"totally": "different"}\n' > "$SERVE/a.json"
