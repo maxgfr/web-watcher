@@ -100,13 +100,22 @@ For a global Codex installation:
 npx skills add maxgfr/web-watcher --skill web-watcher --agent codex --global
 ```
 
-The skill is **manual only** in Codex (`allow_implicit_invocation: false`) and Claude Code (`disable-model-invocation: true`). Invoke it as `$web-watcher` in Codex or `/web-watcher` in Claude Code, for example:
+The skill is model-invocable **on request**: its description restricts it to explicit requests, so the agent calls it when you ask for it, not on its own. Ask in plain words, or invoke it as `$web-watcher` in Codex or `/web-watcher` in Claude Code, for example:
 
 ```text
 $web-watcher Watch https://example.com/ every 60 seconds for 10 checks and show me content changes.
 ```
 
 It guides the agent through selecting content, inspecting the baseline, starting the watch, and reporting changes or errors. The CLI must be installed separately, for example with `brew install maxgfr/tap/web-watcher`. Installing the skill does not start a watch. Other agents may handle invocation policies differently.
+
+To make it explicit-only again:
+
+| Host | Shipped, on request | Explicit-only |
+| --- | --- | --- |
+| Claude Code | no `disable-model-invocation` in `SKILL.md` | add `disable-model-invocation: true` |
+| Codex | `allow_implicit_invocation: true` under `policy:` in `agents/openai.yaml` | set it to `false` |
+
+Claude Code can do it without touching the file: `"skillOverrides": { "web-watcher": "user-invocable-only" }` in `settings.json` leaves `/web-watcher` working while hiding the skill from the model. Plugin installs ignore `skillOverrides`, so edit the frontmatter there. Updating or reinstalling restores the shipped default, so reapply the change afterwards.
 
 ## Usage
 

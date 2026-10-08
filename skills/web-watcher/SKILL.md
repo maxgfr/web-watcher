@@ -1,7 +1,6 @@
 ---
 name: web-watcher
-description: Watch websites and APIs for changes with the web-watcher CLI, with content filters, persistent baselines, diffs, and optional notifications. Invoke manually.
-disable-model-invocation: true
+description: Watch websites and APIs for changes with the web-watcher CLI, with content filters, persistent baselines, diffs, and optional notifications. Use only when the user explicitly asks for web-watcher or to monitor a page or API for changes.
 ---
 
 # Web Watcher
