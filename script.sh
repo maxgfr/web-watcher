@@ -1436,11 +1436,15 @@ main() {
         if [ "$first_run" = true ]; then
             first_run=false
 
-            # In --once mode, try to load previous baseline from file
+            # Load a previous baseline from file, in --once and continuous mode
+            # alike, so a change made while no watcher ran is still reported.
             # An empty file (pre-created with touch or mktemp) is no baseline.
-            if [ "$ONCE" = true ] && [ -n "$BASELINE_FILE" ] && [ -s "$BASELINE_FILE" ]; then
+            if [ -n "$BASELINE_FILE" ] && [ -s "$BASELINE_FILE" ]; then
                 previous_content=$(cat "$BASELINE_FILE")
                 log_verbose "Loaded baseline from $BASELINE_FILE (${#previous_content} bytes)"
+                if [ "$ONCE" = false ]; then
+                    log_info "Resumed baseline from $BASELINE_FILE"
+                fi
                 # Don't skip comparison — fall through to compare
             else
                 previous_content="$current_content"

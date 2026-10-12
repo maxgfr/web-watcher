@@ -1472,6 +1472,20 @@ t_json_kept_raw_without_jq() {
     assert_eq "$(cat "$TMP/baseline")" "$(cat "$FIXTURES/a.json")"
 }
 
+t_continuous_mode_resumes_baseline() {
+    ww --once --baseline-file "$TMP/baseline" "$BASE/a.json"
+    assert_rc 0
+    sed 's/"price": 10/"price": 12/' "$FIXTURES/a.json" > "$SERVE/a.json"
+
+    # The change happened while no watcher ran: the first check reports it.
+    ww -i 1 -n 1 --baseline-file "$TMP/baseline" "$BASE/a.json"
+    assert_rc 0
+    assert_contains "$OUT" "Resumed baseline from $TMP/baseline"
+    assert_contains "$OUT" "CHANGE DETECTED"
+    assert_not_contains "$OUT" "Baseline captured"
+    assert_eq "$(cat "$TMP/baseline")" "$(jq . "$SERVE/a.json")"
+}
+
 # --- Runner -------------------------------------------------------------------
 
 ALL_TESTS=$(declare -F | awk '{print $3}' | grep '^t_')
