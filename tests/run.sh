@@ -1674,7 +1674,7 @@ t_no_color_env_respected() {
     assert_not_contains "$OUT" "$esc"
 
     # An empty NO_COLOR does not.
-    NO_COLOR= ww_tty --once "$BASE/a.json"
+    NO_COLOR='' ww_tty --once "$BASE/a.json"
     assert_contains "$OUT" "$esc"
 }
 
