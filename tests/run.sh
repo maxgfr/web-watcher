@@ -302,7 +302,7 @@ t_once_detects_change_and_updates_baseline() {
     assert_rc 2
     assert_contains "$OUT" "CHANGE DETECTED"
     assert_not_contains "$OUT" "syntax error"
-    assert_eq "$(cat "$TMP/baseline")" "$(cat "$SERVE/a.json")"
+    assert_eq "$(cat "$TMP/baseline")" "$(jq . "$SERVE/a.json")"
 }
 
 t_once_with_max_runs_keeps_exit_code() {
@@ -313,7 +313,7 @@ t_once_with_max_runs_keeps_exit_code() {
     ww --once -n 1 --baseline-file "$TMP/baseline" "$BASE/a.json"
     assert_rc 2
     assert_contains "$OUT" "CHANGE DETECTED"
-    assert_eq "$(cat "$TMP/baseline")" "$(cat "$SERVE/a.json")"
+    assert_eq "$(cat "$TMP/baseline")" "$(jq . "$SERVE/a.json")"
 }
 
 t_once_no_change_exits_zero() {
@@ -385,7 +385,8 @@ t_change_percent_uses_decimal_point() {
     sed 's/"price": 10/"price": 12/' "$FIXTURES/a.json" > "$SERVE/a.json"
     ww --once --baseline-file "$TMP/baseline" "$BASE/a.json"
     assert_rc 2
-    assert_contains "$OUT" "Change of 9.09% detected"
+    # 1 line out of 14 once the JSON is normalized with jq .
+    assert_contains "$OUT" "Change of 7.14% detected"
 }
 
 t_threshold_minor_change_not_notified() {
@@ -393,7 +394,7 @@ t_threshold_minor_change_not_notified() {
     sed 's/"price": 10/"price": 12/' "$FIXTURES/a.json" > "$SERVE/a.json"
     ww --once -p 50 --baseline-file "$TMP/baseline" "$BASE/a.json"
     assert_rc 0
-    assert_contains "$OUT" "Minor change (9.09% < 50% threshold)"
+    assert_contains "$OUT" "Minor change (7.14% < 50% threshold)"
     assert_not_contains "$OUT" "CHANGE DETECTED"
 }
 
@@ -405,7 +406,7 @@ t_once_threshold_keeps_baseline_until_notified() {
     ww --once -p 50 --baseline-file "$TMP/baseline" "$BASE/a.json"
     assert_rc 0
     assert_contains "$OUT" "Minor change"
-    assert_eq "$(cat "$TMP/baseline")" "$(cat "$FIXTURES/a.json")"
+    assert_eq "$(cat "$TMP/baseline")" "$(jq . "$FIXTURES/a.json")"
 
     ww --once -p 50 --baseline-file "$TMP/baseline" "$BASE/a.json"
     assert_rc 0
@@ -414,7 +415,7 @@ t_once_threshold_keeps_baseline_until_notified() {
     printf '{"totally": "different"}\n' > "$SERVE/a.json"
     ww --once -p 50 --baseline-file "$TMP/baseline" "$BASE/a.json"
     assert_rc 2
-    assert_eq "$(cat "$TMP/baseline")" "$(cat "$SERVE/a.json")"
+    assert_eq "$(cat "$TMP/baseline")" "$(jq . "$SERVE/a.json")"
 }
 
 t_threshold_major_change_notified() {
@@ -1125,7 +1126,7 @@ t_continuous_mode_updates_baseline_file_on_change() {
     wait_bg 10
     assert_rc 0
     assert_contains "$OUT" "CHANGE DETECTED"
-    assert_eq "$(cat "$TMP/baseline")" "$(cat "$SERVE/a.json")"
+    assert_eq "$(cat "$TMP/baseline")" "$(jq . "$SERVE/a.json")"
 }
 
 t_notify_channels_listed_with_separator() {
@@ -1418,6 +1419,57 @@ t_selector_disappearing_is_a_change() {
     ww --once -s 'Sold out' --baseline-file "$TMP/baseline" "$BASE/stock.txt"
     assert_rc 0
     assert_contains "$OUT" "No change"
+}
+
+t_minified_json_change_percent_is_per_field() {
+    # Minified JSON is one line: without normalization any change is 100%.
+    printf '{"a":1,"b":2,"c":3,"d":4}\n' > "$SERVE/m.json"
+    ww --once --baseline-file "$TMP/baseline" "$BASE/m.json"
+    assert_rc 0
+    assert_eq "$(cat "$TMP/baseline")" "$(printf '{\n  "a": 1,\n  "b": 2,\n  "c": 3,\n  "d": 4\n}')"
+
+    printf '{"a":1,"b":2,"c":3,"d":5}\n' > "$SERVE/m.json"
+    ww --once -p 50 --baseline-file "$TMP/baseline" "$BASE/m.json"
+    assert_rc 0
+    assert_contains "$OUT" "Minor change (16.67% < 50% threshold)"
+
+    ww --once --diff --baseline-file "$TMP/baseline" "$BASE/m.json"
+    assert_rc 2
+    assert_contains "$OUT" '-  "d": 4'
+    assert_contains "$OUT" '+  "d": 5'
+}
+
+t_json_key_order_kept() {
+    printf '{"z":1,"a":2}\n' > "$SERVE/order.json"
+    ww --once --baseline-file "$TMP/baseline" "$BASE/order.json"
+    assert_rc 0
+    assert_eq "$(cat "$TMP/baseline")" "$(printf '{\n  "z": 1,\n  "a": 2\n}')"
+}
+
+t_json_with_html_body_kept_raw() {
+    # A JSON Content-Type on a body that is not JSON: compare it raw.
+    printf '<html><body>Oops</body></html>\n' > "$SERVE/a.json"
+    ww --once --baseline-file "$TMP/baseline" "$BASE/a.json"
+    assert_rc 0
+    assert_eq "$(cat "$TMP/baseline")" "<html><body>Oops</body></html>"
+
+    # Not normalized outside a JSON Content-Type either.
+    printf '{"a":1}\n' > "$SERVE/raw.txt"
+    rm -f "$TMP/baseline"
+    ww --once --baseline-file "$TMP/baseline" "$BASE/raw.txt"
+    assert_rc 0
+    assert_eq "$(cat "$TMP/baseline")" '{"a":1}'
+}
+
+t_json_kept_raw_without_jq() {
+    mkdir -p "$TMP/nojq"
+    local tool
+    for tool in bash curl sed grep awk tr cat mktemp rm mv date sleep diff wc mkdir perl; do
+        ln -sf "$(command -v "$tool")" "$TMP/nojq/$tool"
+    done
+    PATH="$TMP/nojq" ww --once --baseline-file "$TMP/baseline" "$BASE/a.json"
+    assert_rc 0
+    assert_eq "$(cat "$TMP/baseline")" "$(cat "$FIXTURES/a.json")"
 }
 
 # --- Runner -------------------------------------------------------------------

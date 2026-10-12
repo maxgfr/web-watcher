@@ -380,7 +380,17 @@ Pass your Telegram bot token and chat ID with `--telegram-token` and `--telegram
 
 ## Upgrading
 
-After upgrading to this version, an existing `--baseline-file` captured by an older version in
+### To 1.5.0
+
+JSON responses are now normalized with `jq .` before comparing (in `api` mode,
+without `--filter`, when the Content-Type is JSON and `jq` is installed): one
+field per line, key order kept. An existing `--baseline-file` holding a JSON
+response captured by an older version will be reported as changed exactly once,
+then compared field by field. Minified JSON no longer counts every change as 100%.
+
+### To 1.2.0
+
+An existing `--baseline-file` captured by an older version in
 website mode will be reported as changed exactly once because the stored text
 representation changed from one word per line to one line per block. The change
 percentage is now per text line. `<pre>`

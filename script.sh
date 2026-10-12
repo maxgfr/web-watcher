@@ -722,6 +722,17 @@ fetch_url() {
 
 # --- Content Processing ---
 
+JSON_TYPE_RE='(application|text)/json|application/[^;]*\+json'
+
+# is_json_type <content_type> — 0 if the Content-Type is JSON (any case)
+is_json_type() {
+    local rc=0
+    shopt -s nocasematch
+    [[ "$1" =~ $JSON_TYPE_RE ]] || rc=1
+    shopt -u nocasematch
+    return "$rc"
+}
+
 detect_mode() {
     local content_type="$1"
 
@@ -1030,6 +1041,7 @@ FILTER_FAILED_RC=3
 process_content() {
     local content="$1"
     local resolved_mode="$2"
+    local content_type="${3:-}"
 
     # Apply jq filter for JSON
     # printf rather than echo throughout: a response consisting of "-n" or
@@ -1041,6 +1053,13 @@ process_content() {
         else
             log_error "jq filter failed on this response (not JSON?); baseline kept"
             return "$FILTER_FAILED_RC"
+        fi
+    elif [ "$resolved_mode" = api ] && is_json_type "$content_type" && command -v jq >/dev/null 2>&1; then
+        # One field per line (key order kept), so minified JSON yields a
+        # meaningful change percentage. A body that is not JSON stays raw.
+        local normalized
+        if normalized=$(printf '%s\n' "$content" | jq . 2>/dev/null); then
+            content="$normalized"
         fi
     fi
 
@@ -1396,7 +1415,7 @@ main() {
         # Process content. A failed filter is a failed check, like a failed
         # fetch: the baseline is kept and nothing is notified.
         local current_content process_rc=0
-        current_content=$(process_content "$LAST_RESPONSE" "$mode") || process_rc=$?
+        current_content=$(process_content "$LAST_RESPONSE" "$mode" "$LAST_CONTENT_TYPE") || process_rc=$?
         if [ "$process_rc" -eq "$FILTER_FAILED_RC" ]; then
             log_to_file "FILTER_FAILED — jq filter failed on the response (HTTP $LAST_HTTP_CODE)"
             if [ "$ONCE" = true ]; then
