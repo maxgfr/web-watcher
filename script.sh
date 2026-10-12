@@ -81,7 +81,10 @@ setup_colors() {
 # --- Helper Functions ---
 
 log_info() {
-    [ "$QUIET" = true ] && return
+    # "return 0", not a bare "return": called from a trap handler, a bare
+    # return reports the status from before the trap (143 after an
+    # interrupted wait on bash 5.2), and set -e would abort the handler.
+    [ "$QUIET" = true ] && return 0
     printf "${BLUE}[INFO]${NC} %s\n" "$1"
 }
 
@@ -250,7 +253,7 @@ send_telegram() {
 # --- Banner ---
 
 print_banner() {
-    [ "$QUIET" = true ] && return
+    [ "$QUIET" = true ] && return 0
     echo -e "${CYAN}"
     echo " ██╗    ██╗███████╗██████╗       ██╗    ██╗ █████╗ ████████╗ ██████╗██╗  ██╗███████╗██████╗ "
     echo " ██║    ██║██╔════╝██╔══██╗      ██║    ██║██╔══██╗╚══██╔══╝██╔════╝██║  ██║██╔════╝██╔══██╗"
@@ -1225,7 +1228,7 @@ config_line() {
 }
 
 print_watch_config() {
-    [ "$QUIET" = true ] && return
+    [ "$QUIET" = true ] && return 0
 
     printf '%bConfiguration:%b\n' "$BOLD" "$NC"
     config_line "URL:" "$URL"
