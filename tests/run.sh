@@ -625,14 +625,14 @@ t_ignore_applies_in_api_mode() {
     assert_contains "$text" '"price": 10'
 }
 
-t_ignore_applies_when_jq_fails() {
-    ww --once -f '.[' --ignore '"rating"' --baseline-file "$TMP/baseline" "$BASE/a.json"
+t_ignore_applies_after_jq_filter() {
+    ww --once -f '{price, rating}' --ignore '"rating"' --baseline-file "$TMP/baseline" "$BASE/a.json"
     assert_rc 0
-    assert_contains "$OUT" "jq filter failed"
     local text
     text=$(cat "$TMP/baseline")
     assert_not_contains "$text" "rating"
-    assert_contains "$text" "price"
+    assert_contains "$text" '"price": 10'
+    assert_not_contains "$text" "vendor"
 }
 
 t_ignore_changes_not_notified() {
@@ -1235,6 +1235,123 @@ for line in sys.stdin.buffer.read().decode("utf-8").splitlines():
         print(sum(2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in line))
 ' | sort -u)
     assert_eq "$widths" "64"
+}
+
+t_telegram_requires_token_and_chat() {
+    ww --once --telegram-token "123:abc" "$BASE/a.json"
+    assert_rc 1
+    assert_contains "$OUT" "Telegram needs both a bot token and a chat ID"
+    assert_not_contains "$OUT" "Starting watch"
+
+    ww --once --telegram-chat 42 "$BASE/a.json"
+    assert_rc 1
+    assert_contains "$OUT" "Telegram needs both a bot token and a chat ID"
+}
+
+t_threshold_above_100_rejected() {
+    ww --once -p 150 "$BASE/a.json"
+    assert_rc 1
+    assert_contains "$OUT" "between 0 and 100"
+    ww --once -p 100.5 "$BASE/a.json"
+    assert_rc 1
+    ww --once -p 100 "$BASE/a.json"
+    assert_rc 0
+    assert_contains "$OUT" "Threshold:  100%"
+}
+
+t_uppercase_scheme_accepted() {
+    ww --once "HTTP://127.0.0.1:$PORT/a.json"
+    assert_rc 0
+    assert_contains "$OUT" "Baseline captured"
+    ww --once "Ftp://127.0.0.1:$PORT/a.json"
+    assert_rc 1
+    assert_contains "$OUT" "must start with http"
+}
+
+t_invalid_selector_rejected() {
+    printf 'Existing baseline\n' > "$TMP/baseline"
+    ww --once -s '[' --baseline-file "$TMP/baseline" "$BASE/a.json"
+    assert_rc 1
+    assert_contains "$OUT" "--selector: invalid pattern"
+    assert_not_contains "$OUT" "Starting watch"
+    assert_eq "$(cat "$TMP/baseline")" "Existing baseline"
+}
+
+t_invalid_jq_filter_rejected_at_startup() {
+    printf 'Existing baseline\n' > "$TMP/baseline"
+    ww --once -f '.[' --baseline-file "$TMP/baseline" "$BASE/a.json"
+    assert_rc 1
+    assert_contains "$OUT" "--filter: invalid jq expression"
+    assert_not_contains "$OUT" "Starting watch"
+    assert_eq "$(cat "$TMP/baseline")" "Existing baseline"
+
+    # A valid filter that fails only at run time is not rejected up front.
+    ww --once -f '.price | error' "$BASE/a.json"
+    assert_not_contains "$OUT" "invalid jq expression"
+}
+
+t_missing_jq_install_hint() {
+    mkdir -p "$TMP/nojq"
+    local tool
+    for tool in bash curl sed grep awk tr cat mktemp rm mv date sleep diff wc mkdir perl; do
+        ln -sf "$(command -v "$tool")" "$TMP/nojq/$tool"
+    done
+    PATH="$TMP/nojq" ww --once -f '.price' "$BASE/a.json"
+    assert_rc 1
+    assert_contains "$OUT" "Missing required dependencies: jq (required for --filter)"
+    assert_not_contains "$OUT" "install jq ("
+    if [[ "$OSTYPE" == darwin* ]]; then
+        if printf '%s\n' "$OUT" | grep -qx '  brew install jq'; then pass; else fail "expected '  brew install jq'"; fi
+    fi
+}
+
+t_log_in_missing_dir_created() {
+    ww --once -l "$TMP/new/logs/ww.log" --baseline-file "$TMP/new/state/base.txt" \
+        --snapshot-dir "$TMP/new/snaps" "$BASE/a.json"
+    assert_rc 0
+    assert_not_contains "$OUT" "No such file"
+    [ -s "$TMP/new/logs/ww.log" ] && pass || fail "log file not written"
+    [ -s "$TMP/new/state/base.txt" ] && pass || fail "baseline file not written"
+    [ -d "$TMP/new/snaps" ] && pass || fail "snapshot dir not created"
+    rm -rf "$TMP/new"
+}
+
+t_unwritable_log_fails_before_fetch() {
+    # The parent "directory" is a regular file: mkdir -p fails even as root.
+    printf 'x\n' > "$TMP/notadir"
+    ww --once -l "$TMP/notadir/ww.log" "$BASE/a.json"
+    assert_rc 1
+    assert_contains "$OUT" "--log: cannot write"
+    assert_not_contains "$OUT" "Starting watch"
+    assert_not_contains "$OUT" "Baseline captured"
+
+    ww --once --baseline-file "$TMP/notadir/base.txt" "$BASE/a.json"
+    assert_rc 1
+    assert_contains "$OUT" "--baseline-file: cannot write"
+    assert_not_contains "$OUT" "Baseline captured"
+
+    ww --once --snapshot-dir "$TMP/notadir/snaps" "$BASE/a.json"
+    assert_rc 1
+    assert_contains "$OUT" "--snapshot-dir: cannot write"
+    rm -f "$TMP/notadir"
+}
+
+t_empty_baseline_file_treated_as_absent() {
+    # mktemp or touch pre-creates an empty file: that is no baseline yet.
+    : > "$TMP/baseline"
+    ww --once --baseline-file "$TMP/baseline" "$BASE/a.json"
+    assert_rc 0
+    assert_contains "$OUT" "Baseline captured"
+    assert_not_contains "$OUT" "CHANGE DETECTED"
+    [ -s "$TMP/baseline" ] && pass || fail "baseline not written"
+}
+
+t_baseline_write_leaves_no_temp_file() {
+    mkdir -p "$TMP/state"
+    ww --once --baseline-file "$TMP/state/base.txt" "$BASE/a.json"
+    assert_rc 0
+    assert_eq "$(ls -A "$TMP/state")" "base.txt"
+    rm -rf "$TMP/state"
 }
 
 # --- Runner -------------------------------------------------------------------

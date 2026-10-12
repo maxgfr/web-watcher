@@ -313,14 +313,17 @@ print_usage() {
 # --- Dependency Check ---
 
 check_dependencies() {
-    local missing=()
+    # Package names (for the install command) and reasons (for the message)
+    local missing=() reasons=()
 
     if ! command -v curl &>/dev/null; then
         missing+=("curl")
+        reasons+=("curl")
     fi
 
     if [ -n "$JQ_FILTER" ] && ! command -v jq &>/dev/null; then
-        missing+=("jq (required for --filter)")
+        missing+=("jq")
+        reasons+=("jq (required for --filter)")
     fi
 
     if command -v diff &>/dev/null; then
@@ -330,7 +333,11 @@ check_dependencies() {
     fi
 
     if [ ${#missing[@]} -gt 0 ]; then
-        log_error "Missing required dependencies: ${missing[*]}"
+        local joined="" r
+        for r in "${reasons[@]}"; do
+            joined="${joined:+$joined, }$r"
+        done
+        log_error "Missing required dependencies: $joined"
         echo ""
         echo "Install them with:"
         if [[ "$OSTYPE" == "darwin"* ]]; then
@@ -404,8 +411,10 @@ parse_args() {
                 ;;
             -p|--threshold)
                 THRESHOLD="${2:?'--threshold requires a value'}"
-                if ! [[ "$THRESHOLD" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
-                    log_error "Threshold must be a number (percentage)"
+                # Above 100% no change could ever be notified.
+                if ! [[ "$THRESHOLD" =~ ^[0-9]+(\.[0-9]+)?$ ]] ||
+                    [ "$(LC_ALL=C awk -v t="$THRESHOLD" 'BEGIN { print (t > 100) ? 1 : 0 }')" = 1 ]; then
+                    log_error "Threshold must be a number between 0 and 100 (got '$THRESHOLD')"
                     exit 1
                 fi
                 shift 2
@@ -447,6 +456,13 @@ parse_args() {
                 ;;
             -s|--selector)
                 SELECTOR="${2:?'--selector requires a value'}"
+                local rc=0
+                # Same grep flags as process_content: exit 2 means a bad pattern.
+                printf '' | grep -ai -e "$SELECTOR" >/dev/null 2>&1 || rc=$?
+                if [ "$rc" -gt 1 ]; then
+                    log_error "--selector: invalid pattern '$SELECTOR'"
+                    exit 1
+                fi
                 shift 2
                 ;;
             --strip-html)
@@ -543,10 +559,60 @@ parse_args() {
         exit 1
     fi
 
-    # Validate URL scheme
-    if [[ ! "$URL" =~ ^https?:// ]]; then
+    # Validate URL scheme (case-insensitive, as curl treats it)
+    if [[ ! "$URL" =~ ^[Hh][Tt][Tt][Pp]([Ss])?:// ]]; then
         log_error "Invalid URL: '$URL' — must start with http:// or https://"
         exit 1
+    fi
+
+    # One Telegram setting without the other would be silently ignored.
+    if { [ -n "$TELEGRAM_TOKEN" ] && [ -z "$TELEGRAM_CHAT_ID" ]; } ||
+        { [ -z "$TELEGRAM_TOKEN" ] && [ -n "$TELEGRAM_CHAT_ID" ]; }; then
+        log_error "Telegram needs both a bot token and a chat ID (--telegram-token and --telegram-chat)"
+        exit 1
+    fi
+}
+
+# validate_jq_filter — compile --filter without running it (needs jq, so it
+# runs after check_dependencies). jq exits 3 on a compile error.
+validate_jq_filter() {
+    [ -n "$JQ_FILTER" ] || return 0
+    local err rc=0
+    err=$(jq -n "if false then ($JQ_FILTER) else empty end" 2>&1 >/dev/null) || rc=$?
+    if [ "$rc" -ne 0 ]; then
+        log_error "--filter: invalid jq expression '$JQ_FILTER'"
+        [ -n "$err" ] && printf '%s\n' "$err" | head -3 >&2
+        exit 1
+    fi
+}
+
+# prepare_parent_dir <option> <file> — create the directory holding <file>
+# and make sure it is writable, so a bad path fails before the first fetch
+# instead of crashing the watcher later.
+prepare_parent_dir() {
+    local option="$1" file="$2" dir
+    dir="${file%/*}"
+    [ "$dir" = "$file" ] && dir="."
+    [ -z "$dir" ] && dir="/"
+    if ! mkdir -p -- "$dir" 2>/dev/null || [ ! -d "$dir" ] || [ ! -w "$dir" ] ||
+        { [ -e "$file" ] && [ ! -w "$file" ]; }; then
+        log_error "$option: cannot write '$file'"
+        exit 1
+    fi
+}
+
+prepare_output_paths() {
+    if [ -n "$LOG_FILE" ]; then
+        prepare_parent_dir "--log" "$LOG_FILE"
+    fi
+    if [ -n "$BASELINE_FILE" ]; then
+        prepare_parent_dir "--baseline-file" "$BASELINE_FILE"
+    fi
+    if [ -n "$SNAPSHOT_DIR" ]; then
+        if ! mkdir -p -- "$SNAPSHOT_DIR" 2>/dev/null || [ ! -w "$SNAPSHOT_DIR" ]; then
+            log_error "--snapshot-dir: cannot write '$SNAPSHOT_DIR'"
+            exit 1
+        fi
     fi
 }
 
@@ -1229,9 +1295,16 @@ cleanup() {
 # --- Main Watch Loop ---
 
 # persist_baseline <content> — write the current baseline to --baseline-file
+# Written to a temporary file in the same directory, then renamed: a crash or
+# a full disk mid-write cannot leave a truncated baseline behind.
 persist_baseline() {
     if [ -n "$BASELINE_FILE" ]; then
-        printf '%s\n' "$1" > "$BASELINE_FILE"
+        local tmp="${BASELINE_FILE}.tmp.$$"
+        if ! { printf '%s\n' "$1" > "$tmp" && mv -f -- "$tmp" "$BASELINE_FILE"; } 2>/dev/null; then
+            rm -f -- "$tmp"
+            log_error "Cannot write baseline file $BASELINE_FILE"
+            exit 1
+        fi
         log_verbose "Baseline saved to $BASELINE_FILE"
     fi
 }
@@ -1263,6 +1336,8 @@ main() {
 
     print_banner
     check_dependencies
+    validate_jq_filter
+    prepare_output_paths
     print_watch_config
 
     # Setup cleanup traps
@@ -1317,7 +1392,8 @@ main() {
             first_run=false
 
             # In --once mode, try to load previous baseline from file
-            if [ "$ONCE" = true ] && [ -n "$BASELINE_FILE" ] && [ -f "$BASELINE_FILE" ]; then
+            # An empty file (pre-created with touch or mktemp) is no baseline.
+            if [ "$ONCE" = true ] && [ -n "$BASELINE_FILE" ] && [ -s "$BASELINE_FILE" ]; then
                 previous_content=$(cat "$BASELINE_FILE")
                 log_verbose "Loaded baseline from $BASELINE_FILE (${#previous_content} bytes)"
                 # Don't skip comparison — fall through to compare
