@@ -655,15 +655,19 @@ t_ignore_shown_in_config() {
 }
 
 t_ignore_applies_when_selector_not_found() {
+    # No match is an empty selection, still stripped and filtered as usual;
+    # the full page is never compared in its place.
     ww --once -m website -s 'missing-selector' --ignore 'ago' --baseline-file "$TMP/baseline" "$BASE/blocks.html"
     assert_rc 0
     assert_contains "$OUT" "Selector pattern not found"
     local text
     text=$(cat "$TMP/baseline")
-    assert_not_contains "$text" "minutes ago"
-    assert_contains "$text" "Item A"
-    # The selector fallback still returns HTML, without later stripping.
-    assert_contains "$text" "<html>"
+    assert_eq "$text" ""
+    assert_not_contains "$text" "<html>"
+
+    ww --once -m website -s 'missing-selector' --ignore 'ago' --baseline-file "$TMP/baseline" "$BASE/blocks.html"
+    assert_rc 0
+    assert_contains "$OUT" "No change"
 }
 
 t_ignore_multiple_patterns_keep_non_utf8_content() {
@@ -1352,6 +1356,68 @@ t_baseline_write_leaves_no_temp_file() {
     assert_rc 0
     assert_eq "$(ls -A "$TMP/state")" "base.txt"
     rm -rf "$TMP/state"
+}
+
+t_jq_failure_on_error_page_keeps_baseline() {
+    # An API that answers 200 with an HTML error page must not be compared
+    # raw: no false alert, no baseline overwritten, no second alert after.
+    local error_page='<html><body><h1>502 Bad Gateway</h1></body></html>'
+    ww --once -f '.price' --baseline-file "$TMP/baseline" "$BASE/a.json"
+    assert_rc 0
+    assert_eq "$(cat "$TMP/baseline")" "10"
+
+    printf '%s\n' "$error_page" > "$SERVE/a.json"
+    ww --once -f '.price' --baseline-file "$TMP/baseline" "$BASE/a.json"
+    assert_rc 1
+    assert_contains "$OUT" "jq filter failed"
+    assert_not_contains "$OUT" "CHANGE DETECTED"
+    assert_eq "$(cat "$TMP/baseline")" "10"
+
+    cp "$FIXTURES/a.json" "$SERVE/a.json"
+    ww --once -f '.price' --baseline-file "$TMP/baseline" "$BASE/a.json"
+    assert_rc 0
+    assert_contains "$OUT" "No change"
+
+    # A failing first run captures no baseline at all.
+    rm -f "$TMP/baseline"
+    printf '%s\n' "$error_page" > "$SERVE/a.json"
+    ww --once -f '.price' --baseline-file "$TMP/baseline" "$BASE/a.json"
+    assert_rc 1
+    assert_not_contains "$OUT" "Baseline captured"
+    [ -e "$TMP/baseline" ] && fail "baseline written from an error page" || pass
+}
+
+t_jq_failure_in_continuous_mode_not_notified() {
+    run_bg -i 1 -n 3 -f '.price' --slack "$BASE/hook/slack" -l "$TMP/ww.log" \
+        --baseline-file "$TMP/baseline" "$BASE/a.json"
+    wait_for_file "$TMP/baseline" 5 || fail "baseline file not written on first run"
+    printf '<html><body>Maintenance</body></html>\n' > "$SERVE/a.json"
+    wait_bg 10
+    assert_rc 0
+    assert_contains "$OUT" "jq filter failed"
+    assert_contains "$OUT" "Reached max runs (3)"
+    assert_not_contains "$OUT" "CHANGE DETECTED"
+    assert_eq "$(hook_count)" "0"
+    assert_eq "$(cat "$TMP/baseline")" "10"
+    assert_contains "$(cat "$TMP/ww.log")" "FILTER_FAILED"
+    rm -f "$TMP/ww.log"
+}
+
+t_selector_disappearing_is_a_change() {
+    printf 'Widget\nSold out\nFooter\n' > "$SERVE/stock.txt"
+    ww --once -s 'Sold out' --baseline-file "$TMP/baseline" "$BASE/stock.txt"
+    assert_rc 0
+    assert_eq "$(cat "$TMP/baseline")" "Sold out"
+
+    printf 'Widget\nIn stock\nFooter\n' > "$SERVE/stock.txt"
+    ww --once -s 'Sold out' --baseline-file "$TMP/baseline" "$BASE/stock.txt"
+    assert_rc 2
+    assert_contains "$OUT" "Selector pattern not found"
+    assert_contains "$OUT" "CHANGE DETECTED"
+
+    ww --once -s 'Sold out' --baseline-file "$TMP/baseline" "$BASE/stock.txt"
+    assert_rc 0
+    assert_contains "$OUT" "No change"
 }
 
 # --- Runner -------------------------------------------------------------------

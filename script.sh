@@ -1021,10 +1021,15 @@ apply_ignore_patterns() {
     fi
 }
 
+# Exit status of process_content when --filter fails on a response.
+FILTER_FAILED_RC=3
+
+# process_content <content> <mode> — print the text to compare. Returns
+# FILTER_FAILED_RC when jq fails (an HTML error page served with a 200, say):
+# the check fails and the baseline is kept, rather than comparing raw bytes.
 process_content() {
     local content="$1"
     local resolved_mode="$2"
-    local fallback=false
 
     # Apply jq filter for JSON
     # printf rather than echo throughout: a response consisting of "-n" or
@@ -1034,24 +1039,28 @@ process_content() {
         if filtered=$(printf '%s\n' "$content" | jq -r "$JQ_FILTER" 2>/dev/null); then
             content="$filtered"
         else
-            log_warn "jq filter failed, using raw content"
-            fallback=true
+            log_error "jq filter failed on this response (not JSON?); baseline kept"
+            return "$FILTER_FAILED_RC"
         fi
     fi
 
-    # Apply grep selector
-    if [ "$fallback" = false ] && [ -n "$SELECTOR" ]; then
-        local selected
-        if selected=$(printf '%s\n' "$content" | grep -ai "$SELECTOR" 2>/dev/null); then
-            content="$selected"
-        else
-            log_warn "Selector pattern not found, using full content"
-            fallback=true
+    # Apply grep selector. No match is an empty selection, compared as usual:
+    # the watched lines disappearing is itself a change.
+    if [ -n "$SELECTOR" ]; then
+        local selected rc=0
+        selected=$(printf '%s\n' "$content" | grep -ai -e "$SELECTOR" 2>/dev/null) || rc=$?
+        if [ "$rc" -gt 1 ]; then
+            log_error "selector failed (grep exit $rc)"
+            return 1
         fi
+        if [ "$rc" -eq 1 ]; then
+            log_warn "Selector pattern not found, comparing an empty selection"
+        fi
+        content="$selected"
     fi
 
-    # Strip HTML if website mode or forced
-    if [ "$fallback" = false ] && { [ "$resolved_mode" = "website" ] || [ "$STRIP_HTML" = true ]; }; then
+    # Strip HTML if website mode or forced (nothing to strip in an empty selection)
+    if [ -n "$content" ] && { [ "$resolved_mode" = "website" ] || [ "$STRIP_HTML" = true ]; }; then
         content=$(printf '%s\n' "$content" | strip_html_tags)
     fi
 
@@ -1371,22 +1380,39 @@ main() {
             print_countdown "$INTERVAL"
             continue
         fi
-        success_count=$((success_count + 1))
 
-        # Detect mode on first successful response
-        if [ -z "$resolved_mode" ]; then
-            resolved_mode=$(detect_mode "$LAST_CONTENT_TYPE")
-            log_verbose "Resolved mode: $resolved_mode"
+        # Detect mode from the first response that processes successfully, so
+        # an error page cannot lock in the wrong mode.
+        local mode="$resolved_mode"
+        if [ -z "$mode" ]; then
+            mode=$(detect_mode "$LAST_CONTENT_TYPE")
         fi
 
         # webindex extraction needs a scratch file
-        if [ "$resolved_mode" = website ] || [ "$STRIP_HTML" = true ]; then
+        if [ "$mode" = website ] || [ "$STRIP_HTML" = true ]; then
             ensure_work_dir
         fi
 
-        # Process content
-        local current_content
-        current_content=$(process_content "$LAST_RESPONSE" "$resolved_mode")
+        # Process content. A failed filter is a failed check, like a failed
+        # fetch: the baseline is kept and nothing is notified.
+        local current_content process_rc=0
+        current_content=$(process_content "$LAST_RESPONSE" "$mode") || process_rc=$?
+        if [ "$process_rc" -eq "$FILTER_FAILED_RC" ]; then
+            log_to_file "FILTER_FAILED — jq filter failed on the response (HTTP $LAST_HTTP_CODE)"
+            if [ "$ONCE" = true ]; then
+                exit 1
+            fi
+            check_max_runs "$run_count" "$change_count" "$success_count"
+            print_countdown "$INTERVAL"
+            continue
+        elif [ "$process_rc" -ne 0 ]; then
+            exit 1
+        fi
+        success_count=$((success_count + 1))
+        if [ -z "$resolved_mode" ]; then
+            resolved_mode="$mode"
+            log_verbose "Resolved mode: $resolved_mode"
+        fi
 
         if [ "$first_run" = true ]; then
             first_run=false
