@@ -1486,6 +1486,102 @@ t_continuous_mode_resumes_baseline() {
     assert_eq "$(cat "$TMP/baseline")" "$(jq . "$SERVE/a.json")"
 }
 
+t_webhooks_from_env_vars() {
+    # Secrets can stay out of the command line (shell history, ps, crontab).
+    WW_SLACK_WEBHOOK="$BASE/hook/slack-env" WW_DISCORD_WEBHOOK="$BASE/hook/discord-env" \
+        WW_TELEGRAM_TOKEN="123:env" WW_TELEGRAM_CHAT_ID="42" WW_TELEGRAM_API="$BASE" \
+        trigger_change "$BASE/a.json"
+    assert_rc 2
+    assert_contains "$OUT" "Notify:     Slack, Discord, Telegram"
+    assert_eq "$(hook_count)" "3"
+    local paths
+    paths=$(cat "$HOOKS"/*.json)
+    assert_contains "$paths" "/hook/slack-env"
+    assert_contains "$paths" "/hook/discord-env"
+    assert_contains "$paths" "/bot123:env/sendMessage"
+    assert_not_contains "$OUT" "[WARN]"
+
+    # Command-line options win over the environment.
+    rm -f "$HOOKS"/* "$TMP/baseline"
+    cp "$FIXTURES/a.json" "$SERVE/a.json"
+    WW_SLACK_WEBHOOK="$BASE/hook/slack-env" trigger_change --slack "$BASE/hook/slack-cli" "$BASE/a.json"
+    assert_rc 2
+    assert_eq "$(hook_count)" "1"
+    assert_contains "$(last_hook path)" "/hook/slack-cli"
+
+    # Telegram from the environment still needs both values.
+    WW_TELEGRAM_TOKEN="123:env" ww --once "$BASE/a.json"
+    assert_rc 1
+    assert_contains "$OUT" "Telegram needs both a bot token and a chat ID"
+}
+
+t_webhook_url_not_in_curl_argv() {
+    # Webhook URLs and the Telegram token are secrets: any local user can read
+    # a process's argv with ps, so they must reach curl another way.
+    mkdir -p "$TMP/shim"
+    cat > "$TMP/shim/curl" <<'EOF'
+#!/bin/sh
+printf '%s\n' "$*" >> "$WW_CURL_ARGV_LOG"
+exec "$WW_REAL_CURL" "$@"
+EOF
+    chmod +x "$TMP/shim/curl"
+    : > "$TMP/curl-argv.log"
+    WW_REAL_CURL="$(command -v curl)" WW_CURL_ARGV_LOG="$TMP/curl-argv.log" PATH="$TMP/shim:$PATH" \
+        WW_TELEGRAM_API="$BASE" trigger_change --slack "$BASE/hook/slack-SECRET1" \
+        --discord "$BASE/hook/discord-SECRET2" --telegram-token "123:SECRET3" --telegram-chat 42 \
+        "$BASE/a.json"
+    assert_rc 2
+    assert_eq "$(hook_count)" "3"
+    assert_not_contains "$OUT" "[WARN]"
+    local argv
+    argv=$(cat "$TMP/curl-argv.log")
+    assert_contains "$argv" "a.json"
+    assert_not_contains "$argv" "SECRET1"
+    assert_not_contains "$argv" "SECRET2"
+    assert_not_contains "$argv" "SECRET3"
+    rm -f "$TMP/shim/curl" "$TMP/curl-argv.log"
+}
+
+t_curl_config_quote() {
+    assert_eq "$(ww_fn curl_config_quote 'http://h/a"b\c')" '"http://h/a\"b\\c"'
+}
+
+t_change_box_printed_before_webhooks() {
+    # A slow or failing webhook must not delay the terminal report.
+    trigger_change --slack "$BASE/hook/fail-slack" "$BASE/a.json"
+    assert_rc 2
+    local box warn
+    box=$(printf '%s\n' "$OUT" | grep -n 'CHANGE DETECTED' | head -1 | cut -d: -f1)
+    warn=$(printf '%s\n' "$OUT" | grep -n 'Slack notification failed' | head -1 | cut -d: -f1)
+    if [ -n "$box" ] && [ -n "$warn" ] && [ "$box" -lt "$warn" ]; then pass; else fail "box at line '$box', warning at line '$warn'"; fi
+}
+
+t_no_sound_silences_macos_notification() {
+    if [[ "$OSTYPE" != darwin* ]]; then
+        echo "  SKIP t_no_sound_silences_macos_notification (macOS only)"
+        return
+    fi
+    mkdir -p "$TMP/shim"
+    cat > "$TMP/shim/osascript" <<'EOF'
+#!/bin/sh
+printf '%s\n' "$*" >> "$WW_OSASCRIPT_LOG"
+EOF
+    chmod +x "$TMP/shim/osascript"
+    : > "$TMP/osascript.log"
+    # ww always passes --no-sound.
+    WW_OSASCRIPT_LOG="$TMP/osascript.log" PATH="$TMP/shim:$PATH" trigger_change "$BASE/a.json"
+    assert_rc 2
+    assert_contains "$(cat "$TMP/osascript.log")" "display notification"
+    assert_not_contains "$(cat "$TMP/osascript.log")" "sound name"
+
+    : > "$TMP/osascript.log"
+    cp "$FIXTURES/a.json" "$SERVE/a.json"
+    WW_OSASCRIPT_LOG="$TMP/osascript.log" PATH="$TMP/shim:$PATH" LC_ALL="$LOC" \
+        "$SH" "$SCRIPT" --no-color --once --baseline-file "$TMP/baseline" "$BASE/a.json" > /dev/null 2>&1
+    assert_contains "$(cat "$TMP/osascript.log")" 'sound name "Glass"'
+    rm -f "$TMP/shim/osascript" "$TMP/osascript.log"
+}
+
 # --- Runner -------------------------------------------------------------------
 
 ALL_TESTS=$(declare -F | awk '{print $3}' | grep '^t_')

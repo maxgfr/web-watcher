@@ -50,10 +50,12 @@ STRIP_HTML=false
 FULL_PAGE=false
 HAS_DIFF=false
 BASELINE_FILE=""
-SLACK_WEBHOOK=""
-DISCORD_WEBHOOK=""
-TELEGRAM_TOKEN=""
-TELEGRAM_CHAT_ID=""
+# Webhook secrets can come from the environment, out of argv and shell
+# history; the command-line options take precedence.
+SLACK_WEBHOOK="${WW_SLACK_WEBHOOK:-}"
+DISCORD_WEBHOOK="${WW_DISCORD_WEBHOOK:-}"
+TELEGRAM_TOKEN="${WW_TELEGRAM_TOKEN:-}"
+TELEGRAM_CHAT_ID="${WW_TELEGRAM_CHAT_ID:-}"
 SLEEP_PID=""
 WORK_DIR=""
 IS_TTY=false
@@ -122,19 +124,8 @@ send_notification() {
         printf '\a'
     fi
 
-    # OS-level notification
-    if [[ "$OSTYPE" == "darwin"* ]]; then
-        osascript -e "display notification \"$(applescript_escape "$message")\" with title \"$(applescript_escape "$title")\" sound name \"Glass\"" 2>/dev/null || true
-    elif command -v notify-send &>/dev/null; then
-        notify-send "$title" "$message" 2>/dev/null || true
-    fi
-
-    # Webhook notifications
-    [ -n "$SLACK_WEBHOOK" ] && send_slack "$title" "$message"
-    [ -n "$DISCORD_WEBHOOK" ] && send_discord "$title" "$message"
-    [ -n "$TELEGRAM_TOKEN" ] && [ -n "$TELEGRAM_CHAT_ID" ] && send_telegram "$title" "$message"
-
-    # Always print to terminal. Colors go through %b, data through %s, so a
+    # Always print to terminal, first: a slow or failing webhook must not
+    # delay the report. Colors go through %b, data through %s, so a
     # backslash in the URL or the message is printed as is.
     echo ""
     printf '%b%s%b\n' "${RED}${BOLD}" "╔══════════════════════════════════════════════════════════════╗" "$NC"
@@ -144,6 +135,29 @@ send_notification() {
     printf '  %bTime:%b %s\n' "$BOLD" "$NC" "$(date '+%Y-%m-%d %H:%M:%S')"
     printf '  %bInfo:%b %s\n' "$BOLD" "$NC" "$message"
     echo ""
+
+    # OS-level notification (--no-sound silences it too)
+    if [[ "$OSTYPE" == "darwin"* ]]; then
+        local script
+        script="display notification \"$(applescript_escape "$message")\" with title \"$(applescript_escape "$title")\""
+        if [ "$SOUND" = true ]; then
+            script="$script sound name \"Glass\""
+        fi
+        osascript -e "$script" 2>/dev/null || true
+    elif command -v notify-send &>/dev/null; then
+        notify-send "$title" "$message" 2>/dev/null || true
+    fi
+
+    # Webhook notifications
+    if [ -n "$SLACK_WEBHOOK" ]; then
+        send_slack "$title" "$message"
+    fi
+    if [ -n "$DISCORD_WEBHOOK" ]; then
+        send_discord "$title" "$message"
+    fi
+    if [ -n "$TELEGRAM_TOKEN" ] && [ -n "$TELEGRAM_CHAT_ID" ]; then
+        send_telegram "$title" "$message"
+    fi
 }
 
 # --- Webhook Notifications ---
@@ -175,12 +189,32 @@ json_escape() {
     printf '"%s"' "$s"
 }
 
+# Print $1 as a double-quoted curl config value (curl -K syntax).
+curl_config_quote() {
+    local s="$1"
+    s=${s//\\/\\\\}
+    s=${s//\"/\\\"}
+    s=${s//$'\n'/\\n}
+    s=${s//$'\r'/\\r}
+    s=${s//$'\t'/\\t}
+    printf '"%s"' "$s"
+}
+
+# curl_secret_url <url> [curl options...] — run curl on a URL that holds a
+# secret (webhook, bot token). The URL goes through a config read on stdin,
+# so it never shows up in the process list.
+curl_secret_url() {
+    local url="$1"
+    shift
+    printf 'url = %s\n' "$(curl_config_quote "$url")" | curl -K - "$@"
+}
+
 # POST a JSON document to a webhook. -f makes HTTP 4xx/5xx a failure so the
 # caller can report it instead of silently losing the notification.
 post_json() {
     local url="$1" payload="$2"
-    curl -fs -X POST -H 'Content-Type: application/json' --max-time "$TIMEOUT" \
-        -d "$payload" -- "$url" >/dev/null 2>&1
+    curl_secret_url "$url" -fs -X POST -H 'Content-Type: application/json' --max-time "$TIMEOUT" \
+        -d "$payload" >/dev/null 2>&1
 }
 
 send_slack() {
@@ -201,10 +235,10 @@ send_telegram() {
     # Fields are url-encoded (a "&" in the URL would otherwise start a new
     # parameter) and sent as plain text: no parse_mode, so "_" and "*" in URLs
     # need no escaping.
-    curl -fs -X POST --max-time "$TIMEOUT" \
+    curl_secret_url "${api}/bot${TELEGRAM_TOKEN}/sendMessage" -fs -X POST --max-time "$TIMEOUT" \
         --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
         --data-urlencode "text=${title}"$'\n'"${message}"$'\n'"${URL}" \
-        -- "${api}/bot${TELEGRAM_TOKEN}/sendMessage" >/dev/null 2>&1 || log_warn "Telegram notification failed"
+        >/dev/null 2>&1 || log_warn "Telegram notification failed"
 }
 
 # --- Banner ---
