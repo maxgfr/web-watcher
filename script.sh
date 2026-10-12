@@ -107,6 +107,12 @@ log_verbose() {
     fi
 }
 
+# byte_length <string> — length in bytes, not characters, whatever the locale
+byte_length() {
+    local LC_ALL=C
+    printf '%s' "${#1}"
+}
+
 log_to_file() {
     if [ -n "$LOG_FILE" ]; then
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$LOG_FILE"
@@ -721,14 +727,14 @@ fetch_url() {
             continue
         }
 
-        # Parse response using our custom delimiters
-        local http_code content_type response
-
-        # grep -a: a body with bytes that are not valid in the current locale
-        # would otherwise be reported as "Binary file" instead of passed through.
-        http_code=$(printf '%s\n' "$raw_output" | grep -a "^${RESPONSE_DELIM}HTTP_CODE:" | sed "s/^${RESPONSE_DELIM}HTTP_CODE://")
-        content_type=$(printf '%s\n' "$raw_output" | grep -a "^${RESPONSE_DELIM}CONTENT_TYPE:" | sed "s/^${RESPONSE_DELIM}CONTENT_TYPE://")
-        response=$(printf '%s\n' "$raw_output" | grep -av "^${RESPONSE_DELIM}")
+        # Parse the trailer curl appends after the body. Only its last
+        # occurrence counts, so a body line that happens to start with the
+        # delimiter is kept as content. Parameter expansion, no subprocess.
+        local http_code content_type response meta
+        meta="${raw_output##*"$RESPONSE_DELIM"HTTP_CODE:}"
+        http_code="${meta%%$'\n'*}"
+        content_type="${meta#*"$RESPONSE_DELIM"CONTENT_TYPE:}"
+        response="${raw_output%$'\n'"$RESPONSE_DELIM"HTTP_CODE:*}"
 
         # Check HTTP status
         if [[ "$http_code" =~ ^[45] ]]; then
@@ -756,13 +762,17 @@ fetch_url() {
 
 # --- Content Processing ---
 
-JSON_TYPE_RE='(application|text)/json|application/[^;]*\+json'
-
-# is_json_type <content_type> — 0 if the Content-Type is JSON (any case)
-is_json_type() {
-    local rc=0
+# content_type_is <json|html> <content_type> — case-insensitive Content-Type
+# test, in-process (no echo | grep per check).
+content_type_is() {
+    local re rc=0
+    case "$1" in
+        json) re='(application|text)/json|application/[^;]*\+json' ;;
+        html) re='text/html|application/xhtml' ;;
+        *) return 1 ;;
+    esac
     shopt -s nocasematch
-    [[ "$1" =~ $JSON_TYPE_RE ]] || rc=1
+    [[ "$2" =~ $re ]] || rc=1
     shopt -u nocasematch
     return "$rc"
 }
@@ -775,9 +785,9 @@ detect_mode() {
         return
     fi
 
-    if echo "$content_type" | grep -qi 'application/json\|text/json\|application/.*+json'; then
+    if content_type_is json "$content_type"; then
         echo "api"
-    elif echo "$content_type" | grep -qi 'text/html\|application/xhtml'; then
+    elif content_type_is html "$content_type"; then
         echo "website"
     else
         echo "api"
@@ -1088,7 +1098,7 @@ process_content() {
             log_error "jq filter failed on this response (not JSON?); baseline kept"
             return "$FILTER_FAILED_RC"
         fi
-    elif [ "$resolved_mode" = api ] && is_json_type "$content_type" && command -v jq >/dev/null 2>&1; then
+    elif [ "$resolved_mode" = api ] && content_type_is json "$content_type" && command -v jq >/dev/null 2>&1; then
         # One field per line (key order kept), so minified JSON yields a
         # meaningful change percentage. A body that is not JSON stays raw.
         local normalized
@@ -1130,54 +1140,34 @@ calculate_change_percent() {
     local old="$1"
     local new="$2"
 
-    local old_len=${#old}
-    local new_len=${#new}
-
-    if [ "$old_len" -eq 0 ] && [ "$new_len" -eq 0 ]; then
+    if [ -z "$old" ] && [ -z "$new" ]; then
         echo "0"
         return
     fi
 
-    if [ "$old_len" -eq 0 ]; then
+    if [ -z "$old" ]; then
         echo "100"
         return
     fi
 
-    # Use diff to count changed lines
-    local old_lines new_lines changed_lines
-    old_lines=$(printf '%s\n' "$old" | wc -l | tr -d ' ')
-    new_lines=$(printf '%s\n' "$new" | wc -l | tr -d ' ')
-
-    if [ "$old_lines" -eq 0 ]; then
-        old_lines=1
-    fi
-
-    # Count differing lines (each side separately to avoid double-counting)
-    local diff_output removed_count added_count
-    diff_output=$(diff_lines "$old" "$new")
-    removed_count=$(printf '%s\n' "$diff_output" | grep -ac '^<' || true)
-    added_count=$(printf '%s\n' "$diff_output" | grep -ac '^>' || true)
-    if [ "$removed_count" -gt "$added_count" ]; then
-        changed_lines="$removed_count"
-    else
-        changed_lines="$added_count"
-    fi
-
-    # Percentage relative to total lines
-    local total_lines
-    if [ "$old_lines" -gt "$new_lines" ]; then
-        total_lines="$old_lines"
-    else
-        total_lines="$new_lines"
-    fi
-    if [ "$total_lines" -eq 0 ]; then
-        total_lines=1
-    fi
-
-    # Use awk for floating point. LC_ALL=C forces a decimal point: under a
-    # locale with a decimal comma (fr_FR, de_DE, ...) awk would print "9,09",
-    # which then breaks every numeric comparison made on the result.
-    LC_ALL=C awk -v c="$changed_lines" -v t="$total_lines" 'BEGIN { printf "%.2f", (c / t) * 100 }'
+    # One awk pass reads both sides (line totals), then their diff (lines
+    # removed "<" and added ">", counted separately to avoid double-counting).
+    # The percentage is relative to the longer side. LC_ALL=C forces a
+    # decimal point: under a locale with a decimal comma (fr_FR, de_DE, ...)
+    # awk would print "9,09", which then breaks every numeric comparison.
+    diff_lines "$old" "$new" | LC_ALL=C awk '
+        FNR == 1 { file++ }
+        file == 1 { old_lines++; next }
+        file == 2 { new_lines++; next }
+        /^</ { removed++ }
+        /^>/ { added++ }
+        END {
+            changed = (removed > added) ? removed : added
+            total = (old_lines > new_lines) ? old_lines : new_lines
+            if (total == 0) total = 1
+            printf "%.2f", (changed / total) * 100
+        }
+    ' <(printf '%s\n' "$old") <(printf '%s\n' "$new") -
 }
 
 # 0 (true) if change percentage $1 reaches threshold $2.
@@ -1268,7 +1258,7 @@ print_watch_config() {
         config_line "Ignore:" "${#IGNORE_PATTERNS[@]} pattern(s)"
     fi
     if [ -n "$BODY" ]; then
-        config_line "Body:" "(${#BODY} bytes)"
+        config_line "Body:" "($(byte_length "$BODY") bytes)"
     fi
     if [ -n "$LOG_FILE" ]; then
         config_line "Log:" "$LOG_FILE"
@@ -1475,7 +1465,7 @@ main() {
             # An empty file (pre-created with touch or mktemp) is no baseline.
             if [ -n "$BASELINE_FILE" ] && [ -s "$BASELINE_FILE" ]; then
                 previous_content=$(cat "$BASELINE_FILE")
-                log_verbose "Loaded baseline from $BASELINE_FILE (${#previous_content} bytes)"
+                log_verbose "Loaded baseline from $BASELINE_FILE ($(byte_length "$previous_content") bytes)"
                 if [ "$ONCE" = false ]; then
                     log_info "Resumed baseline from $BASELINE_FILE"
                 fi
@@ -1483,8 +1473,10 @@ main() {
             else
                 previous_content="$current_content"
                 save_snapshot "$current_content" "initial"
-                log_success "Baseline captured (HTTP $LAST_HTTP_CODE, ${#current_content} bytes, mode: $resolved_mode)"
-                log_to_file "BASELINE — HTTP $LAST_HTTP_CODE, ${#current_content} bytes"
+                local size
+                size=$(byte_length "$current_content")
+                log_success "Baseline captured (HTTP $LAST_HTTP_CODE, $size bytes, mode: $resolved_mode)"
+                log_to_file "BASELINE — HTTP $LAST_HTTP_CODE, $size bytes"
                 persist_baseline "$current_content"
 
                 if [ "$ONCE" = true ]; then
@@ -1508,7 +1500,9 @@ main() {
             local cr=""
             [ "$IS_TTY" = true ] && cr=$'\r'
             [ "$QUIET" = false ] && printf "%s  ${DIM}[%s] Check #%d — No change (uptime: %s)${NC}\n" "$cr" "$ts" "$run_count" "$elapsed_fmt"
-            log_verbose "No change (${#current_content} bytes)"
+            if [ "$VERBOSE" = true ]; then
+                log_verbose "No change ($(byte_length "$current_content") bytes)"
+            fi
         else
             # Calculate change percentage
             local change_pct

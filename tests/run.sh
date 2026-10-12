@@ -137,13 +137,17 @@ assert_not_contains() {
 
 # Extract and call a pure script.sh function without HTTP, in a subshell under
 # the current shell/locale so unit tests exercise the same matrix as ww.
+# Functions it calls are listed in $WW_FN_DEPS (space-separated).
 ww_fn() {
-    local fn="$1" body
+    local fn="$1" body dep
     shift
     # A plain assignment on purpose: bash 3.2 (the harness shell on macOS
     # runners) mis-parses a $( ) containing "()" when it is itself nested
     # inside a double-quoted argument, and brace-expands "{" there too.
     body=$(sed -n "/^$fn() [{]/,/^[}]/p" "$SCRIPT")
+    for dep in ${WW_FN_DEPS:-}; do
+        body="$body"$'\n'$(sed -n "/^$dep() [{]/,/^[}]/p" "$SCRIPT")
+    done
     LC_ALL="$LOC" "$SH" -c 'set -euo pipefail; eval "$1"; shift; "$@"' ww_fn "$body" "$fn" "$@"
 }
 
@@ -1580,6 +1584,56 @@ EOF
         "$SH" "$SCRIPT" --no-color --once --baseline-file "$TMP/baseline" "$BASE/a.json" > /dev/null 2>&1
     assert_contains "$(cat "$TMP/osascript.log")" 'sound name "Glass"'
     rm -f "$TMP/shim/osascript" "$TMP/osascript.log"
+}
+
+t_body_line_starting_with_delimiter_kept() {
+    # The body is never mistaken for curl's status trailer.
+    printf 'first\n__WW_DELIM_7f3a9e__HTTP_CODE:500\n__WW_DELIM_7f3a9e__CONTENT_TYPE:text/html\nlast\n' > "$SERVE/delim.txt"
+    ww --once --baseline-file "$TMP/baseline" "$BASE/delim.txt"
+    assert_rc 0
+    assert_contains "$OUT" "HTTP 200"
+    assert_eq "$(cat "$TMP/baseline")" "$(cat "$SERVE/delim.txt")"
+}
+
+t_sizes_reported_in_bytes() {
+    # Under fr_FR.UTF-8, ${#var} counts "é" as one character, not two bytes.
+    printf 'caf\303\251\n' > "$SERVE/cafe.txt"
+    ww --once "$BASE/cafe.txt"
+    assert_rc 0
+    assert_contains "$OUT" "HTTP 200, 5 bytes"
+
+    ww --once -X POST -d "$(printf 'caf\303\251')" "$BASE/hook/body"
+    assert_rc 0
+    assert_contains "$OUT" "Body:       (5 bytes)"
+}
+
+t_change_percent_counts_lines() {
+    printf 'a\nb\nc\nd\n' > "$SERVE/lines.txt"
+    ww --once --baseline-file "$TMP/baseline" "$BASE/lines.txt"
+    # One line replaced, one added: 2 changed lines out of max(4, 5).
+    printf 'a\nB\nc\nd\ne\n' > "$SERVE/lines.txt"
+    ww --once --baseline-file "$TMP/baseline" "$BASE/lines.txt"
+    assert_rc 2
+    assert_contains "$OUT" "Change of 40.00% detected"
+    # Everything removed but one line: 4 of 5.
+    printf 'a\n' > "$SERVE/lines.txt"
+    ww --once --baseline-file "$TMP/baseline" "$BASE/lines.txt"
+    assert_rc 2
+    assert_contains "$OUT" "Change of 80.00% detected"
+}
+
+t_content_type_detection_is_case_insensitive() {
+    local MODE=auto
+    export MODE
+    assert_eq "$(WW_FN_DEPS=content_type_is ww_fn detect_mode 'Application/JSON; charset=UTF-8')" "api"
+    assert_eq "$(WW_FN_DEPS=content_type_is ww_fn detect_mode 'TEXT/HTML')" "website"
+    assert_eq "$(WW_FN_DEPS=content_type_is ww_fn detect_mode 'application/vnd.api+json')" "api"
+    assert_eq "$(WW_FN_DEPS=content_type_is ww_fn detect_mode 'application/xhtml+xml')" "website"
+    assert_eq "$(WW_FN_DEPS=content_type_is ww_fn detect_mode 'text/plain')" "api"
+    MODE=website
+    assert_eq "$(WW_FN_DEPS=content_type_is ww_fn detect_mode 'application/json')" "website"
+    if ww_fn content_type_is json 'APPLICATION/JSON'; then pass; else fail "uppercase JSON type not detected"; fi
+    if ww_fn content_type_is json 'text/html'; then fail "HTML detected as JSON"; else pass; fi
 }
 
 # --- Runner -------------------------------------------------------------------
