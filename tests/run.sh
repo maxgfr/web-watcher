@@ -166,7 +166,8 @@ wait_bg() {
     local max_seconds="$1" i=0
     while kill -0 "$BG_PID" 2>/dev/null; do
         if [ "$i" -ge $((max_seconds * 10)) ]; then
-            kill "$BG_PID" 2>/dev/null
+            # SIGKILL: a script stuck in a foreground sleep defers SIGTERM.
+            kill -KILL "$BG_PID" 2>/dev/null
             wait "$BG_PID" 2>/dev/null
             RC=124
             OUT=$(cat "$TMP/bg.out")
@@ -178,6 +179,26 @@ wait_bg() {
     wait "$BG_PID"
     RC=$?
     OUT=$(cat "$TMP/bg.out")
+}
+
+# Like run_bg, but with SIGINT restored to its default: a background job of a
+# non-interactive shell starts with SIGINT ignored, and bash cannot trap a
+# signal that was ignored on entry.
+run_bg_int() {
+    LC_ALL="$LOC" perl -e '$SIG{INT} = "DEFAULT"; exec @ARGV or die "exec: $!"' \
+        "$SH" "$SCRIPT" --no-color --no-sound "$@" > "$TMP/bg.out" 2>&1 < /dev/null &
+    BG_PID=$!
+}
+
+# Wait (up to N seconds) for the background run's output to contain a string.
+wait_for_output() {
+    local text="$1" max_seconds="$2" i=0
+    until grep -qF -- "$text" "$TMP/bg.out" 2>/dev/null; do
+        if [ "$i" -ge $((max_seconds * 10)) ]; then return 1; fi
+        sleep 0.1
+        i=$((i + 1))
+    done
+    return 0
 }
 
 # Wait (up to N seconds) for a file to exist and be non-empty.
@@ -1119,6 +1140,66 @@ t_retry_delay_zero_accepted() {
     ww --once --retry-delay 0 "$BASE/a.json"
     assert_rc 0
     assert_contains "$OUT" "Baseline captured"
+}
+
+t_sigterm_stops_quiet_watch_promptly() {
+    run_bg -q -i 60 "$BASE/a.json"
+    wait_for_output "Baseline captured" 5 || fail "baseline not captured"
+    sleep 0.3
+    kill -TERM "$BG_PID"
+    wait_bg 2
+    assert_rc 0
+    assert_contains "$OUT" "Baseline captured"
+}
+
+t_sigterm_during_retry_delay() {
+    # Port 1 refuses connections; the watcher sits in a 30s retry delay.
+    run_bg -i 60 --retries 3 --retry-delay 30 http://127.0.0.1:1/
+    wait_for_output "Request failed (attempt 1/3)" 5 || fail "first attempt not reported"
+    sleep 0.3
+    kill -TERM "$BG_PID"
+    wait_bg 2
+    assert_rc 0
+    assert_contains "$OUT" "Stopped watching"
+}
+
+t_once_interrupted_exit_code() {
+    # A cron job or an agent must not read an interrupted check as "no change".
+    run_bg --once --retries 2 --retry-delay 30 http://127.0.0.1:1/
+    wait_for_output "Request failed (attempt 1/2)" 5 || fail "first attempt not reported"
+    sleep 0.3
+    kill -TERM "$BG_PID"
+    wait_bg 2
+    assert_rc 143
+
+    run_bg_int --once --retries 2 --retry-delay 30 http://127.0.0.1:1/
+    wait_for_output "Request failed (attempt 1/2)" 5 || fail "first attempt not reported"
+    sleep 0.3
+    kill -INT "$BG_PID"
+    wait_bg 2
+    assert_rc 130
+
+    # Continuous mode: Ctrl+C is the normal way to stop, so it exits 0.
+    run_bg_int -i 60 "$BASE/a.json"
+    wait_for_output "Baseline captured" 5 || fail "baseline not captured"
+    sleep 0.3
+    kill -INT "$BG_PID"
+    wait_bg 2
+    assert_rc 0
+}
+
+t_interrupt_leaves_no_temp_files() {
+    if ! command -v webindex >/dev/null 2>&1; then
+        echo "  SKIP t_interrupt_leaves_no_temp_files (webindex not installed)"
+        return
+    fi
+    mkdir -p "$TMP/extract-tmp"
+    TMPDIR="$TMP/extract-tmp" run_bg -i 60 -m website "$BASE/page.html"
+    wait_for_output "Baseline captured" 10 || fail "baseline not captured"
+    kill -TERM "$BG_PID"
+    wait_bg 2
+    assert_rc 0
+    assert_eq "$(find "$TMP/extract-tmp" -mindepth 1 | wc -l | tr -d ' ')" "0"
 }
 
 # --- Runner -------------------------------------------------------------------

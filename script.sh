@@ -54,6 +54,8 @@ SLACK_WEBHOOK=""
 DISCORD_WEBHOOK=""
 TELEGRAM_TOKEN=""
 TELEGRAM_CHAT_ID=""
+SLEEP_PID=""
+WORK_DIR=""
 
 # --- Colors ---
 setup_colors() {
@@ -610,7 +612,7 @@ fetch_url() {
             log_warn "Request failed (attempt $attempt/$RETRIES)"
             if [ "$attempt" -lt "$RETRIES" ]; then
                 log_verbose "Retrying in ${RETRY_DELAY}s..."
-                sleep "$RETRY_DELAY"
+                wait_sleep "$RETRY_DELAY"
             fi
             attempt=$((attempt + 1))
             continue
@@ -629,7 +631,7 @@ fetch_url() {
         if [[ "$http_code" =~ ^[45] ]]; then
             log_warn "HTTP $http_code received (attempt $attempt/$RETRIES)"
             if [ "$attempt" -lt "$RETRIES" ]; then
-                sleep "$RETRY_DELAY"
+                wait_sleep "$RETRY_DELAY"
             fi
             attempt=$((attempt + 1))
             continue
@@ -869,11 +871,10 @@ resolve_html_stripper() {
 }
 
 strip_html_tags_webindex() {
-    local tmp output rc=0 fallback=perl
-    tmp=$(mktemp "${TMPDIR:-/tmp}/ww.XXXXXX") || return $?
-    mv "$tmp" "$tmp.html" || { rc=$?; rm -f "$tmp"; return "$rc"; }
-    tmp="$tmp.html"
-    cat > "$tmp" || { rc=$?; rm -f "$tmp"; return "$rc"; }
+    # main creates WORK_DIR before stripping and the EXIT trap removes it, so
+    # an interrupted extraction leaves no file behind.
+    local tmp="${WORK_DIR:?}/page.html" output rc=0 fallback=perl
+    cat > "$tmp" || return $?
     if [ "$FULL_PAGE" = true ]; then
         output=$(webindex extract "$tmp" --full-page) || rc=$?
     else
@@ -1159,15 +1160,25 @@ print_watch_config() {
     echo ""
 }
 
+# wait_sleep <secs> — sleep in the background and wait for it: a trapped
+# signal interrupts "wait" at once, where a foreground sleep would defer the
+# trap until the sleep ends.
+wait_sleep() {
+    sleep "$1" &
+    SLEEP_PID=$!
+    wait "$SLEEP_PID" || true
+    SLEEP_PID=""
+}
+
 print_countdown() {
     local remaining="$1"
     if [ "$QUIET" = true ]; then
-        sleep "$remaining"
+        wait_sleep "$remaining"
         return
     fi
     while [ "$remaining" -gt 0 ]; do
         printf "\r${DIM}  ⏳ Next check in %ds...  ${NC}" "$remaining"
-        sleep 1
+        wait_sleep 1
         remaining=$((remaining - 1))
     done
     printf "\r                                        \r"
@@ -1175,9 +1186,32 @@ print_countdown() {
 
 # --- Cleanup ---
 
+# ensure_work_dir — create the private scratch directory once, in the main
+# shell: an assignment made in a subshell would be lost and the dir leaked.
+ensure_work_dir() {
+    if [ -z "$WORK_DIR" ]; then
+        WORK_DIR=$(mktemp -d "${TMPDIR:-/tmp}/ww.XXXXXX")
+    fi
+}
+
+remove_work_dir() {
+    if [ -n "$WORK_DIR" ]; then
+        rm -rf -- "$WORK_DIR"
+    fi
+}
+
+# cleanup <exit_code> — signal handler. An interrupted --once check exits 130
+# (INT) or 143 (TERM) so a cron job or an agent cannot read it as "no change";
+# stopping a continuous watch is the normal way out and exits 0.
 cleanup() {
+    if [ -n "$SLEEP_PID" ]; then
+        kill "$SLEEP_PID" 2>/dev/null || true
+    fi
     echo ""
     log_info "Stopped watching. Goodbye!"
+    if [ "$ONCE" = true ]; then
+        exit "$1"
+    fi
     exit 0
 }
 
@@ -1220,8 +1254,10 @@ main() {
     check_dependencies
     print_watch_config
 
-    # Setup cleanup trap
-    trap cleanup SIGINT SIGTERM
+    # Setup cleanup traps
+    trap 'cleanup 130' INT
+    trap 'cleanup 143' TERM
+    trap remove_work_dir EXIT
 
     local previous_content=""
     local run_count=0
@@ -1255,6 +1291,11 @@ main() {
         if [ -z "$resolved_mode" ]; then
             resolved_mode=$(detect_mode "$LAST_CONTENT_TYPE")
             log_verbose "Resolved mode: $resolved_mode"
+        fi
+
+        # webindex extraction needs a scratch file
+        if [ "$resolved_mode" = website ] || [ "$STRIP_HTML" = true ]; then
+            ensure_work_dir
         fi
 
         # Process content
