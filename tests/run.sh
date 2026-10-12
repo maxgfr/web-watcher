@@ -137,13 +137,17 @@ assert_not_contains() {
 
 # Extract and call a pure script.sh function without HTTP, in a subshell under
 # the current shell/locale so unit tests exercise the same matrix as ww.
+# Functions it calls are listed in $WW_FN_DEPS (space-separated).
 ww_fn() {
-    local fn="$1" body
+    local fn="$1" body dep
     shift
     # A plain assignment on purpose: bash 3.2 (the harness shell on macOS
     # runners) mis-parses a $( ) containing "()" when it is itself nested
     # inside a double-quoted argument, and brace-expands "{" there too.
     body=$(sed -n "/^$fn() [{]/,/^[}]/p" "$SCRIPT")
+    for dep in ${WW_FN_DEPS:-}; do
+        body="$body"$'\n'$(sed -n "/^$dep() [{]/,/^[}]/p" "$SCRIPT")
+    done
     LC_ALL="$LOC" "$SH" -c 'set -euo pipefail; eval "$1"; shift; "$@"' ww_fn "$body" "$fn" "$@"
 }
 
@@ -166,7 +170,8 @@ wait_bg() {
     local max_seconds="$1" i=0
     while kill -0 "$BG_PID" 2>/dev/null; do
         if [ "$i" -ge $((max_seconds * 10)) ]; then
-            kill "$BG_PID" 2>/dev/null
+            # SIGKILL: a script stuck in a foreground sleep defers SIGTERM.
+            kill -KILL "$BG_PID" 2>/dev/null
             wait "$BG_PID" 2>/dev/null
             RC=124
             OUT=$(cat "$TMP/bg.out")
@@ -178,6 +183,44 @@ wait_bg() {
     wait "$BG_PID"
     RC=$?
     OUT=$(cat "$TMP/bg.out")
+}
+
+# Like run_bg, but with SIGINT restored to its default: a background job of a
+# non-interactive shell starts with SIGINT ignored, and bash cannot trap a
+# signal that was ignored on entry.
+run_bg_int() {
+    LC_ALL="$LOC" perl -e '$SIG{INT} = "DEFAULT"; exec @ARGV or die "exec: $!"' \
+        "$SH" "$SCRIPT" --no-color --no-sound "$@" > "$TMP/bg.out" 2>&1 < /dev/null &
+    BG_PID=$!
+}
+
+# Run script.sh with stdout on a pseudo-terminal (script(1): BSD/macOS or
+# util-linux syntax), without the --no-color ww adds; sets OUT and RC.
+ww_tty() {
+    local cmd q arg
+    if script --version 2>/dev/null | grep -q util-linux; then
+        cmd="LC_ALL=$(printf '%q' "$LOC") $(printf '%q' "$SH") $(printf '%q' "$SCRIPT") --no-sound"
+        for arg in "$@"; do
+            printf -v q '%q' "$arg"
+            cmd="$cmd $q"
+        done
+        OUT=$(script -qec "$cmd" /dev/null < /dev/null 2>&1)
+        RC=$?
+    else
+        OUT=$(LC_ALL="$LOC" script -q /dev/null "$SH" "$SCRIPT" --no-sound "$@" < /dev/null 2>&1)
+        RC=$?
+    fi
+}
+
+# Wait (up to N seconds) for the background run's output to contain a string.
+wait_for_output() {
+    local text="$1" max_seconds="$2" i=0
+    until grep -qF -- "$text" "$TMP/bg.out" 2>/dev/null; do
+        if [ "$i" -ge $((max_seconds * 10)) ]; then return 1; fi
+        sleep 0.1
+        i=$((i + 1))
+    done
+    return 0
 }
 
 # Wait (up to N seconds) for a file to exist and be non-empty.
@@ -211,6 +254,23 @@ last_hook_body_is_json() {
     [ -n "$latest" ] || return 1
     "$PYTHON" -c 'import json,sys; json.loads(json.load(open(sys.argv[1]))["body"])' "$latest" 2>/dev/null
 }
+
+# script.sh normalizes JSON with `jq .` only when jq keeps number literals
+# (1.7+, see setup_json_normalize); with an older jq, JSON is compared as
+# served. Same probe here, so expectations follow the installed jq.
+JQ_NORMALIZES=false
+if [ "$(printf '1234567890123456789\n' | jq . 2>/dev/null)" = 1234567890123456789 ]; then
+    JQ_NORMALIZES=true
+fi
+
+# The text script.sh compares for a served JSON file.
+as_compared_json() {
+    if [ "$JQ_NORMALIZES" = true ]; then jq . "$1"; else cat "$1"; fi
+}
+
+# Change percentage of the price edit in a.json: 1 line of 14 once
+# normalized, 1 of 11 as served.
+if [ "$JQ_NORMALIZES" = true ]; then A_JSON_PCT="7.14"; else A_JSON_PCT="9.09"; fi
 
 reset_fixtures() {
     rm -f "$SERVE"/* "$HOOKS"/* "$TMP/baseline"
@@ -281,7 +341,7 @@ t_once_detects_change_and_updates_baseline() {
     assert_rc 2
     assert_contains "$OUT" "CHANGE DETECTED"
     assert_not_contains "$OUT" "syntax error"
-    assert_eq "$(cat "$TMP/baseline")" "$(cat "$SERVE/a.json")"
+    assert_eq "$(cat "$TMP/baseline")" "$(as_compared_json "$SERVE/a.json")"
 }
 
 t_once_with_max_runs_keeps_exit_code() {
@@ -292,7 +352,7 @@ t_once_with_max_runs_keeps_exit_code() {
     ww --once -n 1 --baseline-file "$TMP/baseline" "$BASE/a.json"
     assert_rc 2
     assert_contains "$OUT" "CHANGE DETECTED"
-    assert_eq "$(cat "$TMP/baseline")" "$(cat "$SERVE/a.json")"
+    assert_eq "$(cat "$TMP/baseline")" "$(as_compared_json "$SERVE/a.json")"
 }
 
 t_once_no_change_exits_zero() {
@@ -364,7 +424,7 @@ t_change_percent_uses_decimal_point() {
     sed 's/"price": 10/"price": 12/' "$FIXTURES/a.json" > "$SERVE/a.json"
     ww --once --baseline-file "$TMP/baseline" "$BASE/a.json"
     assert_rc 2
-    assert_contains "$OUT" "Change of 9.09% detected"
+    assert_contains "$OUT" "Change of ${A_JSON_PCT}% detected"
 }
 
 t_threshold_minor_change_not_notified() {
@@ -372,7 +432,7 @@ t_threshold_minor_change_not_notified() {
     sed 's/"price": 10/"price": 12/' "$FIXTURES/a.json" > "$SERVE/a.json"
     ww --once -p 50 --baseline-file "$TMP/baseline" "$BASE/a.json"
     assert_rc 0
-    assert_contains "$OUT" "Minor change (9.09% < 50% threshold)"
+    assert_contains "$OUT" "Minor change (${A_JSON_PCT}% < 50% threshold)"
     assert_not_contains "$OUT" "CHANGE DETECTED"
 }
 
@@ -384,7 +444,7 @@ t_once_threshold_keeps_baseline_until_notified() {
     ww --once -p 50 --baseline-file "$TMP/baseline" "$BASE/a.json"
     assert_rc 0
     assert_contains "$OUT" "Minor change"
-    assert_eq "$(cat "$TMP/baseline")" "$(cat "$FIXTURES/a.json")"
+    assert_eq "$(cat "$TMP/baseline")" "$(as_compared_json "$FIXTURES/a.json")"
 
     ww --once -p 50 --baseline-file "$TMP/baseline" "$BASE/a.json"
     assert_rc 0
@@ -393,7 +453,7 @@ t_once_threshold_keeps_baseline_until_notified() {
     printf '{"totally": "different"}\n' > "$SERVE/a.json"
     ww --once -p 50 --baseline-file "$TMP/baseline" "$BASE/a.json"
     assert_rc 2
-    assert_eq "$(cat "$TMP/baseline")" "$(cat "$SERVE/a.json")"
+    assert_eq "$(cat "$TMP/baseline")" "$(as_compared_json "$SERVE/a.json")"
 }
 
 t_threshold_major_change_notified() {
@@ -604,14 +664,14 @@ t_ignore_applies_in_api_mode() {
     assert_contains "$text" '"price": 10'
 }
 
-t_ignore_applies_when_jq_fails() {
-    ww --once -f '.[' --ignore '"rating"' --baseline-file "$TMP/baseline" "$BASE/a.json"
+t_ignore_applies_after_jq_filter() {
+    ww --once -f '{price, rating}' --ignore '"rating"' --baseline-file "$TMP/baseline" "$BASE/a.json"
     assert_rc 0
-    assert_contains "$OUT" "jq filter failed"
     local text
     text=$(cat "$TMP/baseline")
     assert_not_contains "$text" "rating"
-    assert_contains "$text" "price"
+    assert_contains "$text" '"price": 10'
+    assert_not_contains "$text" "vendor"
 }
 
 t_ignore_changes_not_notified() {
@@ -634,15 +694,19 @@ t_ignore_shown_in_config() {
 }
 
 t_ignore_applies_when_selector_not_found() {
+    # No match is an empty selection, still stripped and filtered as usual;
+    # the full page is never compared in its place.
     ww --once -m website -s 'missing-selector' --ignore 'ago' --baseline-file "$TMP/baseline" "$BASE/blocks.html"
     assert_rc 0
     assert_contains "$OUT" "Selector pattern not found"
     local text
     text=$(cat "$TMP/baseline")
-    assert_not_contains "$text" "minutes ago"
-    assert_contains "$text" "Item A"
-    # The selector fallback still returns HTML, without later stripping.
-    assert_contains "$text" "<html>"
+    assert_eq "$text" ""
+    assert_not_contains "$text" "<html>"
+
+    ww --once -m website -s 'missing-selector' --ignore 'ago' --baseline-file "$TMP/baseline" "$BASE/blocks.html"
+    assert_rc 0
+    assert_contains "$OUT" "No change"
 }
 
 t_ignore_multiple_patterns_keep_non_utf8_content() {
@@ -1100,7 +1164,7 @@ t_continuous_mode_updates_baseline_file_on_change() {
     wait_bg 10
     assert_rc 0
     assert_contains "$OUT" "CHANGE DETECTED"
-    assert_eq "$(cat "$TMP/baseline")" "$(cat "$SERVE/a.json")"
+    assert_eq "$(cat "$TMP/baseline")" "$(as_compared_json "$SERVE/a.json")"
 }
 
 t_notify_channels_listed_with_separator() {
@@ -1119,6 +1183,565 @@ t_retry_delay_zero_accepted() {
     ww --once --retry-delay 0 "$BASE/a.json"
     assert_rc 0
     assert_contains "$OUT" "Baseline captured"
+}
+
+t_sigterm_stops_quiet_watch_promptly() {
+    run_bg -q -i 60 "$BASE/a.json"
+    wait_for_output "Baseline captured" 5 || fail "baseline not captured"
+    sleep 0.3
+    kill -TERM "$BG_PID"
+    wait_bg 2
+    assert_rc 0
+    assert_contains "$OUT" "Baseline captured"
+}
+
+t_sigterm_during_retry_delay() {
+    # Port 1 refuses connections; the watcher sits in a 30s retry delay.
+    run_bg -i 60 --retries 3 --retry-delay 30 http://127.0.0.1:1/
+    wait_for_output "Request failed (attempt 1/3)" 5 || fail "first attempt not reported"
+    sleep 0.3
+    kill -TERM "$BG_PID"
+    wait_bg 2
+    assert_rc 0
+    assert_contains "$OUT" "Stopped watching"
+}
+
+t_once_interrupted_exit_code() {
+    # A cron job or an agent must not read an interrupted check as "no change".
+    run_bg --once --retries 2 --retry-delay 30 http://127.0.0.1:1/
+    wait_for_output "Request failed (attempt 1/2)" 5 || fail "first attempt not reported"
+    sleep 0.3
+    kill -TERM "$BG_PID"
+    wait_bg 2
+    assert_rc 143
+
+    run_bg_int --once --retries 2 --retry-delay 30 http://127.0.0.1:1/
+    wait_for_output "Request failed (attempt 1/2)" 5 || fail "first attempt not reported"
+    sleep 0.3
+    kill -INT "$BG_PID"
+    wait_bg 2
+    assert_rc 130
+
+    # Continuous mode: Ctrl+C is the normal way to stop, so it exits 0.
+    run_bg_int -i 60 "$BASE/a.json"
+    wait_for_output "Baseline captured" 5 || fail "baseline not captured"
+    sleep 0.3
+    kill -INT "$BG_PID"
+    wait_bg 2
+    assert_rc 0
+}
+
+t_interrupt_leaves_no_temp_files() {
+    if ! command -v webindex >/dev/null 2>&1; then
+        echo "  SKIP t_interrupt_leaves_no_temp_files (webindex not installed)"
+        return
+    fi
+    mkdir -p "$TMP/extract-tmp"
+    TMPDIR="$TMP/extract-tmp" run_bg -i 60 -m website "$BASE/page.html"
+    wait_for_output "Baseline captured" 10 || fail "baseline not captured"
+    kill -TERM "$BG_PID"
+    wait_bg 2
+    assert_rc 0
+    assert_eq "$(find "$TMP/extract-tmp" -mindepth 1 | wc -l | tr -d ' ')" "0"
+}
+
+t_no_countdown_when_not_a_tty() {
+    # Cron, agents and "> file" capture stdout: no countdown, no carriage return.
+    ww -i 1 -n 2 "$BASE/a.json"
+    assert_rc 0
+    assert_contains "$OUT" "No change"
+    assert_not_contains "$OUT" "Next check"
+    assert_not_contains "$OUT" "$(printf '\r')"
+}
+
+t_backslashes_in_user_input_printed_verbatim() {
+    ww --once -s 'price\b' "$BASE/a.json"
+    assert_rc 0
+    assert_contains "$OUT" 'Selector:   price\b'
+    assert_not_contains "$OUT" "$(printf '\b')"
+
+    trigger_change "$BASE/a.json?q=a\tb"
+    assert_rc 2
+    assert_contains "$OUT" 'URL:        '"$BASE"'/a.json?q=a\tb'
+    assert_contains "$OUT" 'detected on '"$BASE"'/a.json?q=a\tb'
+    assert_not_contains "$OUT" "$(printf '\t')"
+}
+
+t_change_box_is_aligned() {
+    trigger_change "$BASE/a.json"
+    assert_rc 2
+    local widths
+    widths=$(printf '%s\n' "$OUT" | "$PYTHON" -c '
+import sys, unicodedata
+for line in sys.stdin.buffer.read().decode("utf-8").splitlines():
+    if line[:1] in ("╔", "║", "╚"):
+        print(sum(2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in line))
+' | sort -u)
+    assert_eq "$widths" "64"
+}
+
+t_telegram_requires_token_and_chat() {
+    ww --once --telegram-token "123:abc" "$BASE/a.json"
+    assert_rc 1
+    assert_contains "$OUT" "Telegram needs both a bot token and a chat ID"
+    assert_not_contains "$OUT" "Starting watch"
+
+    ww --once --telegram-chat 42 "$BASE/a.json"
+    assert_rc 1
+    assert_contains "$OUT" "Telegram needs both a bot token and a chat ID"
+}
+
+t_threshold_above_100_rejected() {
+    ww --once -p 150 "$BASE/a.json"
+    assert_rc 1
+    assert_contains "$OUT" "between 0 and 100"
+    ww --once -p 100.5 "$BASE/a.json"
+    assert_rc 1
+    ww --once -p 100 "$BASE/a.json"
+    assert_rc 0
+    assert_contains "$OUT" "Threshold:  100%"
+}
+
+t_uppercase_scheme_accepted() {
+    ww --once "HTTP://127.0.0.1:$PORT/a.json"
+    assert_rc 0
+    assert_contains "$OUT" "Baseline captured"
+    ww --once "Ftp://127.0.0.1:$PORT/a.json"
+    assert_rc 1
+    assert_contains "$OUT" "must start with http"
+}
+
+t_invalid_selector_rejected() {
+    printf 'Existing baseline\n' > "$TMP/baseline"
+    ww --once -s '[' --baseline-file "$TMP/baseline" "$BASE/a.json"
+    assert_rc 1
+    assert_contains "$OUT" "--selector: invalid pattern"
+    assert_not_contains "$OUT" "Starting watch"
+    assert_eq "$(cat "$TMP/baseline")" "Existing baseline"
+}
+
+t_invalid_jq_filter_rejected_at_startup() {
+    printf 'Existing baseline\n' > "$TMP/baseline"
+    ww --once -f '.[' --baseline-file "$TMP/baseline" "$BASE/a.json"
+    assert_rc 1
+    assert_contains "$OUT" "--filter: invalid jq expression"
+    assert_not_contains "$OUT" "Starting watch"
+    assert_eq "$(cat "$TMP/baseline")" "Existing baseline"
+
+    # A valid filter that fails only at run time is not rejected up front.
+    ww --once -f '.price | error' "$BASE/a.json"
+    assert_not_contains "$OUT" "invalid jq expression"
+}
+
+t_missing_jq_install_hint() {
+    mkdir -p "$TMP/nojq"
+    local tool
+    for tool in bash curl sed grep awk tr cat mktemp rm mv date sleep diff wc mkdir perl; do
+        ln -sf "$(command -v "$tool")" "$TMP/nojq/$tool"
+    done
+    PATH="$TMP/nojq" ww --once -f '.price' "$BASE/a.json"
+    assert_rc 1
+    assert_contains "$OUT" "Missing required dependencies: jq (required for --filter)"
+    assert_not_contains "$OUT" "install jq ("
+    if [[ "$OSTYPE" == darwin* ]]; then
+        if printf '%s\n' "$OUT" | grep -qx '  brew install jq'; then pass; else fail "expected '  brew install jq'"; fi
+    fi
+}
+
+t_log_in_missing_dir_created() {
+    ww --once -l "$TMP/new/logs/ww.log" --baseline-file "$TMP/new/state/base.txt" \
+        --snapshot-dir "$TMP/new/snaps" "$BASE/a.json"
+    assert_rc 0
+    assert_not_contains "$OUT" "No such file"
+    [ -s "$TMP/new/logs/ww.log" ] && pass || fail "log file not written"
+    [ -s "$TMP/new/state/base.txt" ] && pass || fail "baseline file not written"
+    [ -d "$TMP/new/snaps" ] && pass || fail "snapshot dir not created"
+    rm -rf "$TMP/new"
+}
+
+t_unwritable_log_fails_before_fetch() {
+    # The parent "directory" is a regular file: mkdir -p fails even as root.
+    printf 'x\n' > "$TMP/notadir"
+    ww --once -l "$TMP/notadir/ww.log" "$BASE/a.json"
+    assert_rc 1
+    assert_contains "$OUT" "--log: cannot write"
+    assert_not_contains "$OUT" "Starting watch"
+    assert_not_contains "$OUT" "Baseline captured"
+
+    ww --once --baseline-file "$TMP/notadir/base.txt" "$BASE/a.json"
+    assert_rc 1
+    assert_contains "$OUT" "--baseline-file: cannot write"
+    assert_not_contains "$OUT" "Baseline captured"
+
+    ww --once --snapshot-dir "$TMP/notadir/snaps" "$BASE/a.json"
+    assert_rc 1
+    assert_contains "$OUT" "--snapshot-dir: cannot write"
+    rm -f "$TMP/notadir"
+}
+
+t_empty_baseline_file_treated_as_absent() {
+    # mktemp or touch pre-creates an empty file: that is no baseline yet.
+    : > "$TMP/baseline"
+    ww --once --baseline-file "$TMP/baseline" "$BASE/a.json"
+    assert_rc 0
+    assert_contains "$OUT" "Baseline captured"
+    assert_not_contains "$OUT" "CHANGE DETECTED"
+    [ -s "$TMP/baseline" ] && pass || fail "baseline not written"
+}
+
+t_baseline_write_leaves_no_temp_file() {
+    mkdir -p "$TMP/state"
+    ww --once --baseline-file "$TMP/state/base.txt" "$BASE/a.json"
+    assert_rc 0
+    assert_eq "$(ls -A "$TMP/state")" "base.txt"
+    rm -rf "$TMP/state"
+}
+
+t_jq_failure_on_error_page_keeps_baseline() {
+    # An API that answers 200 with an HTML error page must not be compared
+    # raw: no false alert, no baseline overwritten, no second alert after.
+    local error_page='<html><body><h1>502 Bad Gateway</h1></body></html>'
+    ww --once -f '.price' --baseline-file "$TMP/baseline" "$BASE/a.json"
+    assert_rc 0
+    assert_eq "$(cat "$TMP/baseline")" "10"
+
+    printf '%s\n' "$error_page" > "$SERVE/a.json"
+    ww --once -f '.price' --baseline-file "$TMP/baseline" "$BASE/a.json"
+    assert_rc 1
+    assert_contains "$OUT" "jq filter failed"
+    assert_not_contains "$OUT" "CHANGE DETECTED"
+    assert_eq "$(cat "$TMP/baseline")" "10"
+
+    cp "$FIXTURES/a.json" "$SERVE/a.json"
+    ww --once -f '.price' --baseline-file "$TMP/baseline" "$BASE/a.json"
+    assert_rc 0
+    assert_contains "$OUT" "No change"
+
+    # A failing first run captures no baseline at all.
+    rm -f "$TMP/baseline"
+    printf '%s\n' "$error_page" > "$SERVE/a.json"
+    ww --once -f '.price' --baseline-file "$TMP/baseline" "$BASE/a.json"
+    assert_rc 1
+    assert_not_contains "$OUT" "Baseline captured"
+    [ -e "$TMP/baseline" ] && fail "baseline written from an error page" || pass
+}
+
+t_jq_failure_in_continuous_mode_not_notified() {
+    run_bg -i 1 -n 3 -f '.price' --slack "$BASE/hook/slack" -l "$TMP/ww.log" \
+        --baseline-file "$TMP/baseline" "$BASE/a.json"
+    wait_for_file "$TMP/baseline" 5 || fail "baseline file not written on first run"
+    printf '<html><body>Maintenance</body></html>\n' > "$SERVE/a.json"
+    wait_bg 10
+    assert_rc 0
+    assert_contains "$OUT" "jq filter failed"
+    assert_contains "$OUT" "Reached max runs (3)"
+    assert_not_contains "$OUT" "CHANGE DETECTED"
+    assert_eq "$(hook_count)" "0"
+    assert_eq "$(cat "$TMP/baseline")" "10"
+    assert_contains "$(cat "$TMP/ww.log")" "FILTER_FAILED"
+    rm -f "$TMP/ww.log"
+}
+
+t_selector_disappearing_is_a_change() {
+    printf 'Widget\nSold out\nFooter\n' > "$SERVE/stock.txt"
+    ww --once -s 'Sold out' --baseline-file "$TMP/baseline" "$BASE/stock.txt"
+    assert_rc 0
+    assert_eq "$(cat "$TMP/baseline")" "Sold out"
+
+    printf 'Widget\nIn stock\nFooter\n' > "$SERVE/stock.txt"
+    ww --once -s 'Sold out' --baseline-file "$TMP/baseline" "$BASE/stock.txt"
+    assert_rc 2
+    assert_contains "$OUT" "Selector pattern not found"
+    assert_contains "$OUT" "CHANGE DETECTED"
+
+    ww --once -s 'Sold out' --baseline-file "$TMP/baseline" "$BASE/stock.txt"
+    assert_rc 0
+    assert_contains "$OUT" "No change"
+}
+
+t_minified_json_change_percent_is_per_field() {
+    if [ "$JQ_NORMALIZES" = false ]; then
+        echo "  SKIP t_minified_json_change_percent_is_per_field (jq < 1.7: no JSON normalization)"
+        return
+    fi
+    # Minified JSON is one line: without normalization any change is 100%.
+    printf '{"a":1,"b":2,"c":3,"d":4}\n' > "$SERVE/m.json"
+    ww --once --baseline-file "$TMP/baseline" "$BASE/m.json"
+    assert_rc 0
+    assert_eq "$(cat "$TMP/baseline")" "$(printf '{\n  "a": 1,\n  "b": 2,\n  "c": 3,\n  "d": 4\n}')"
+
+    printf '{"a":1,"b":2,"c":3,"d":5}\n' > "$SERVE/m.json"
+    ww --once -p 50 --baseline-file "$TMP/baseline" "$BASE/m.json"
+    assert_rc 0
+    assert_contains "$OUT" "Minor change (16.67% < 50% threshold)"
+
+    ww --once --diff --baseline-file "$TMP/baseline" "$BASE/m.json"
+    assert_rc 2
+    assert_contains "$OUT" '-  "d": 4'
+    assert_contains "$OUT" '+  "d": 5'
+}
+
+t_json_key_order_kept() {
+    if [ "$JQ_NORMALIZES" = false ]; then
+        echo "  SKIP t_json_key_order_kept (jq < 1.7: no JSON normalization)"
+        return
+    fi
+    printf '{"z":1,"a":2}\n' > "$SERVE/order.json"
+    ww --once --baseline-file "$TMP/baseline" "$BASE/order.json"
+    assert_rc 0
+    assert_eq "$(cat "$TMP/baseline")" "$(printf '{\n  "z": 1,\n  "a": 2\n}')"
+}
+
+t_json_with_html_body_kept_raw() {
+    # A JSON Content-Type on a body that is not JSON: compare it raw.
+    printf '<html><body>Oops</body></html>\n' > "$SERVE/a.json"
+    ww --once --baseline-file "$TMP/baseline" "$BASE/a.json"
+    assert_rc 0
+    assert_eq "$(cat "$TMP/baseline")" "<html><body>Oops</body></html>"
+
+    # Not normalized outside a JSON Content-Type either.
+    printf '{"a":1}\n' > "$SERVE/raw.txt"
+    rm -f "$TMP/baseline"
+    ww --once --baseline-file "$TMP/baseline" "$BASE/raw.txt"
+    assert_rc 0
+    assert_eq "$(cat "$TMP/baseline")" '{"a":1}'
+}
+
+t_json_large_integer_change_detected() {
+    # Normalization must never hide a change: jq 1.6 prints numbers as
+    # doubles, turning both IDs below into 1234567890123456800.
+    printf '{"id":1234567890123456789}\n' > "$SERVE/big.json"
+    ww --once --baseline-file "$TMP/baseline" "$BASE/big.json"
+    assert_rc 0
+    assert_contains "$(cat "$TMP/baseline")" "1234567890123456789"
+    printf '{"id":1234567890123456790}\n' > "$SERVE/big.json"
+    ww --once --baseline-file "$TMP/baseline" "$BASE/big.json"
+    assert_rc 2
+    assert_contains "$OUT" "CHANGE DETECTED"
+}
+
+t_json_kept_raw_with_lossy_jq() {
+    # A jq that rounds large integers (1.6 and older) is not used to normalize.
+    mkdir -p "$TMP/lossy"
+    cat > "$TMP/lossy/jq" <<'EOF'
+#!/bin/sh
+input=$(cat)
+if [ "$input" = 1234567890123456789 ]; then echo 1234567890123456800; exit 0; fi
+printf '%s\n' "$input" | exec "$WW_REAL_JQ" "$@"
+EOF
+    chmod +x "$TMP/lossy/jq"
+    WW_REAL_JQ="$(command -v jq)" PATH="$TMP/lossy:$PATH" \
+        ww --once --baseline-file "$TMP/baseline" "$BASE/a.json"
+    assert_rc 0
+    assert_eq "$(cat "$TMP/baseline")" "$(cat "$FIXTURES/a.json")"
+    # --filter still works with such a jq.
+    rm -f "$TMP/baseline"
+    WW_REAL_JQ="$(command -v jq)" PATH="$TMP/lossy:$PATH" \
+        ww --once -f .price --baseline-file "$TMP/baseline" "$BASE/a.json"
+    assert_rc 0
+    assert_eq "$(cat "$TMP/baseline")" "10"
+    rm -rf "$TMP/lossy"
+}
+
+t_json_kept_raw_without_jq() {
+    mkdir -p "$TMP/nojq"
+    local tool
+    for tool in bash curl sed grep awk tr cat mktemp rm mv date sleep diff wc mkdir perl; do
+        ln -sf "$(command -v "$tool")" "$TMP/nojq/$tool"
+    done
+    PATH="$TMP/nojq" ww --once --baseline-file "$TMP/baseline" "$BASE/a.json"
+    assert_rc 0
+    assert_eq "$(cat "$TMP/baseline")" "$(cat "$FIXTURES/a.json")"
+}
+
+t_continuous_mode_resumes_baseline() {
+    ww --once --baseline-file "$TMP/baseline" "$BASE/a.json"
+    assert_rc 0
+    sed 's/"price": 10/"price": 12/' "$FIXTURES/a.json" > "$SERVE/a.json"
+
+    # The change happened while no watcher ran: the first check reports it.
+    ww -i 1 -n 1 --baseline-file "$TMP/baseline" "$BASE/a.json"
+    assert_rc 0
+    assert_contains "$OUT" "Resumed baseline from $TMP/baseline"
+    assert_contains "$OUT" "CHANGE DETECTED"
+    assert_not_contains "$OUT" "Baseline captured"
+    assert_eq "$(cat "$TMP/baseline")" "$(as_compared_json "$SERVE/a.json")"
+}
+
+t_webhooks_from_env_vars() {
+    # Secrets can stay out of the command line (shell history, ps, crontab).
+    WW_SLACK_WEBHOOK="$BASE/hook/slack-env" WW_DISCORD_WEBHOOK="$BASE/hook/discord-env" \
+        WW_TELEGRAM_TOKEN="123:env" WW_TELEGRAM_CHAT_ID="42" WW_TELEGRAM_API="$BASE" \
+        trigger_change "$BASE/a.json"
+    assert_rc 2
+    assert_contains "$OUT" "Notify:     Slack, Discord, Telegram"
+    assert_eq "$(hook_count)" "3"
+    local paths
+    paths=$(cat "$HOOKS"/*.json)
+    assert_contains "$paths" "/hook/slack-env"
+    assert_contains "$paths" "/hook/discord-env"
+    assert_contains "$paths" "/bot123:env/sendMessage"
+    assert_not_contains "$OUT" "[WARN]"
+
+    # Command-line options win over the environment.
+    rm -f "$HOOKS"/* "$TMP/baseline"
+    cp "$FIXTURES/a.json" "$SERVE/a.json"
+    WW_SLACK_WEBHOOK="$BASE/hook/slack-env" trigger_change --slack "$BASE/hook/slack-cli" "$BASE/a.json"
+    assert_rc 2
+    assert_eq "$(hook_count)" "1"
+    assert_contains "$(last_hook path)" "/hook/slack-cli"
+
+    # Telegram from the environment still needs both values.
+    WW_TELEGRAM_TOKEN="123:env" ww --once "$BASE/a.json"
+    assert_rc 1
+    assert_contains "$OUT" "Telegram needs both a bot token and a chat ID"
+}
+
+t_webhook_url_not_in_curl_argv() {
+    # Webhook URLs and the Telegram token are secrets: any local user can read
+    # a process's argv with ps, so they must reach curl another way.
+    mkdir -p "$TMP/shim"
+    cat > "$TMP/shim/curl" <<'EOF'
+#!/bin/sh
+printf '%s\n' "$*" >> "$WW_CURL_ARGV_LOG"
+exec "$WW_REAL_CURL" "$@"
+EOF
+    chmod +x "$TMP/shim/curl"
+    : > "$TMP/curl-argv.log"
+    WW_REAL_CURL="$(command -v curl)" WW_CURL_ARGV_LOG="$TMP/curl-argv.log" PATH="$TMP/shim:$PATH" \
+        WW_TELEGRAM_API="$BASE" trigger_change --slack "$BASE/hook/slack-SECRET1" \
+        --discord "$BASE/hook/discord-SECRET2" --telegram-token "123:SECRET3" --telegram-chat 42 \
+        "$BASE/a.json"
+    assert_rc 2
+    assert_eq "$(hook_count)" "3"
+    assert_not_contains "$OUT" "[WARN]"
+    local argv
+    argv=$(cat "$TMP/curl-argv.log")
+    assert_contains "$argv" "a.json"
+    assert_not_contains "$argv" "SECRET1"
+    assert_not_contains "$argv" "SECRET2"
+    assert_not_contains "$argv" "SECRET3"
+    rm -f "$TMP/shim/curl" "$TMP/curl-argv.log"
+}
+
+t_curl_config_quote() {
+    assert_eq "$(ww_fn curl_config_quote 'http://h/a"b\c')" '"http://h/a\"b\\c"'
+}
+
+t_change_box_printed_before_webhooks() {
+    # A slow or failing webhook must not delay the terminal report.
+    trigger_change --slack "$BASE/hook/fail-slack" "$BASE/a.json"
+    assert_rc 2
+    local box warn
+    box=$(printf '%s\n' "$OUT" | grep -n 'CHANGE DETECTED' | head -1 | cut -d: -f1)
+    warn=$(printf '%s\n' "$OUT" | grep -n 'Slack notification failed' | head -1 | cut -d: -f1)
+    if [ -n "$box" ] && [ -n "$warn" ] && [ "$box" -lt "$warn" ]; then pass; else fail "box at line '$box', warning at line '$warn'"; fi
+}
+
+t_no_sound_silences_macos_notification() {
+    if [[ "$OSTYPE" != darwin* ]]; then
+        echo "  SKIP t_no_sound_silences_macos_notification (macOS only)"
+        return
+    fi
+    mkdir -p "$TMP/shim"
+    cat > "$TMP/shim/osascript" <<'EOF'
+#!/bin/sh
+printf '%s\n' "$*" >> "$WW_OSASCRIPT_LOG"
+EOF
+    chmod +x "$TMP/shim/osascript"
+    : > "$TMP/osascript.log"
+    # ww always passes --no-sound.
+    WW_OSASCRIPT_LOG="$TMP/osascript.log" PATH="$TMP/shim:$PATH" trigger_change "$BASE/a.json"
+    assert_rc 2
+    assert_contains "$(cat "$TMP/osascript.log")" "display notification"
+    assert_not_contains "$(cat "$TMP/osascript.log")" "sound name"
+
+    : > "$TMP/osascript.log"
+    cp "$FIXTURES/a.json" "$SERVE/a.json"
+    WW_OSASCRIPT_LOG="$TMP/osascript.log" PATH="$TMP/shim:$PATH" LC_ALL="$LOC" \
+        "$SH" "$SCRIPT" --no-color --once --baseline-file "$TMP/baseline" "$BASE/a.json" > /dev/null 2>&1
+    assert_contains "$(cat "$TMP/osascript.log")" 'sound name "Glass"'
+    rm -f "$TMP/shim/osascript" "$TMP/osascript.log"
+}
+
+t_body_line_starting_with_delimiter_kept() {
+    # The body is never mistaken for curl's status trailer.
+    printf 'first\n__WW_DELIM_7f3a9e__HTTP_CODE:500\n__WW_DELIM_7f3a9e__CONTENT_TYPE:text/html\nlast\n' > "$SERVE/delim.txt"
+    ww --once --baseline-file "$TMP/baseline" "$BASE/delim.txt"
+    assert_rc 0
+    assert_contains "$OUT" "HTTP 200"
+    assert_eq "$(cat "$TMP/baseline")" "$(cat "$SERVE/delim.txt")"
+}
+
+t_sizes_reported_in_bytes() {
+    # Under fr_FR.UTF-8, ${#var} counts "é" as one character, not two bytes.
+    printf 'caf\303\251\n' > "$SERVE/cafe.txt"
+    ww --once "$BASE/cafe.txt"
+    assert_rc 0
+    assert_contains "$OUT" "HTTP 200, 5 bytes"
+
+    ww --once -X POST -d "$(printf 'caf\303\251')" "$BASE/hook/body"
+    assert_rc 0
+    assert_contains "$OUT" "Body:       (5 bytes)"
+}
+
+t_change_percent_counts_lines() {
+    printf 'a\nb\nc\nd\n' > "$SERVE/lines.txt"
+    ww --once --baseline-file "$TMP/baseline" "$BASE/lines.txt"
+    # One line replaced, one added: 2 changed lines out of max(4, 5).
+    printf 'a\nB\nc\nd\ne\n' > "$SERVE/lines.txt"
+    ww --once --baseline-file "$TMP/baseline" "$BASE/lines.txt"
+    assert_rc 2
+    assert_contains "$OUT" "Change of 40.00% detected"
+    # Everything removed but one line: 4 of 5.
+    printf 'a\n' > "$SERVE/lines.txt"
+    ww --once --baseline-file "$TMP/baseline" "$BASE/lines.txt"
+    assert_rc 2
+    assert_contains "$OUT" "Change of 80.00% detected"
+}
+
+t_content_type_detection_is_case_insensitive() {
+    local MODE=auto
+    export MODE
+    assert_eq "$(WW_FN_DEPS=content_type_is ww_fn detect_mode 'Application/JSON; charset=UTF-8')" "api"
+    assert_eq "$(WW_FN_DEPS=content_type_is ww_fn detect_mode 'TEXT/HTML')" "website"
+    assert_eq "$(WW_FN_DEPS=content_type_is ww_fn detect_mode 'application/vnd.api+json')" "api"
+    assert_eq "$(WW_FN_DEPS=content_type_is ww_fn detect_mode 'application/xhtml+xml')" "website"
+    assert_eq "$(WW_FN_DEPS=content_type_is ww_fn detect_mode 'text/plain')" "api"
+    MODE=website
+    assert_eq "$(WW_FN_DEPS=content_type_is ww_fn detect_mode 'application/json')" "website"
+    if ww_fn content_type_is json 'APPLICATION/JSON'; then pass; else fail "uppercase JSON type not detected"; fi
+    if ww_fn content_type_is json 'text/html'; then fail "HTML detected as JSON"; else pass; fi
+}
+
+t_no_color_env_respected() {
+    local esc
+    esc=$(printf '\033[')
+    # Control: on a terminal, colors are on by default.
+    ww_tty --once "$BASE/a.json"
+    assert_rc 0
+    assert_contains "$OUT" "Baseline captured"
+    assert_contains "$OUT" "$esc"
+
+    # https://no-color.org: any non-empty NO_COLOR disables colors.
+    NO_COLOR=1 ww_tty --once "$BASE/a.json"
+    assert_rc 0
+    assert_contains "$OUT" "Baseline captured"
+    assert_not_contains "$OUT" "$esc"
+
+    ww_tty --once --no-color "$BASE/a.json"
+    assert_rc 0
+    assert_not_contains "$OUT" "$esc"
+
+    # An empty NO_COLOR does not.
+    NO_COLOR='' ww_tty --once "$BASE/a.json"
+    assert_contains "$OUT" "$esc"
+}
+
+t_countdown_shown_on_a_tty() {
+    ww_tty -i 2 -n 2 "$BASE/a.json"
+    assert_rc 0
+    assert_contains "$OUT" "Next check in"
 }
 
 # --- Runner -------------------------------------------------------------------

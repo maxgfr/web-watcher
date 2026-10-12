@@ -20,7 +20,7 @@
 - **HTML selector** — grep patterns to monitor specific parts of a page
 - **Custom headers & auth** — Bearer tokens, cookies, Basic auth, custom User-Agent
 - **POST support** — watch API search endpoints with custom request bodies
-- **Retry logic** — configurable retries with backoff on failure
+- **Retry logic** — configurable attempts per check, with a fixed delay between them
 - **Snapshots** — save every response to disk for later analysis
 - **Diff output** — see exactly what changed between checks
 - **Logging** — timestamped log file of all changes
@@ -53,7 +53,7 @@ sudo ln -s "$(pwd)/script.sh" /usr/local/bin/web-watcher
 
 ### Dependencies
 
-Only `curl` is required. `jq` is needed if you use the `--filter` option. In `website` mode, `webindex` is recommended for the most accurate HTML-to-text extraction (`brew install maxgfr/tap/webindex`); the Homebrew formula for `web-watcher` installs it automatically. `perl` (present on macOS and nearly every Linux distribution) is recommended as a fallback; without either tool, a sed/awk fallback is used. `python3` is only needed to run the test suite.
+Only `curl` is required. `jq` is needed if you use the `--filter` option; jq 1.7 or newer also normalizes JSON responses one field per line. In `website` mode, `webindex` is recommended for the most accurate HTML-to-text extraction (`brew install maxgfr/tap/webindex`); the Homebrew formula for `web-watcher` installs it automatically. `perl` (present on macOS and nearly every Linux distribution) is recommended as a fallback; without either tool, a sed/awk fallback is used. `python3` is only needed to run the test suite.
 
 **macOS:**
 ```bash
@@ -142,12 +142,21 @@ web-watcher [options] <url>
 | Option | Description | Default |
 |---|---|---|
 | `-i, --interval <secs>` | Seconds between checks | `30` |
-| `-p, --threshold <percent>` | Min change % to trigger alert | `0` (any) |
+| `-p, --threshold <percent>` | Min change % to trigger alert, 0 to 100 | `0` (any) |
 | `-n, --max-runs <num>` | Stop after N checks (0 = unlimited) | `0` |
 | `--once` | Run single check then exit | disabled |
-| `--baseline-file <file>` | Persist baseline to disk (for `--once`) | — |
-| `--retries <num>` | Retries on failure | `3` |
-| `--retry-delay <secs>` | Delay between retries | `5` |
+| `--baseline-file <file>` | Persist baseline to disk; resumed by `--once` and continuous mode | — |
+| `--retries <num>` | Attempts per check, the first one included | `3` |
+| `--retry-delay <secs>` | Fixed delay between attempts | `5` |
+
+`--log`, `--baseline-file` and `--snapshot-dir` create missing parent
+directories at startup; a path that cannot be written is an error before the
+first fetch. An empty baseline file (pre-created with `touch` or `mktemp`)
+counts as no baseline.
+
+With a non-empty `--baseline-file`, a continuous watch resumes it and compares
+from the first check (`Resumed baseline from …`), so a change made while no
+watcher ran is reported. Use a new path for a fresh baseline.
 
 ### Content Options
 
@@ -162,6 +171,13 @@ web-watcher [options] <url>
 
 `--ignore` accepts POSIX extended regular expressions (ERE) and applies in all modes.
 
+An invalid `--filter`, `--selector` or `--ignore` is rejected at startup. When
+`--filter` cannot parse a response (an API answering 200 with an HTML error
+page, say), the check fails: the baseline is kept, `--once` exits 1, and a
+continuous watch counts it as a failed fetch. A `--selector` that matches
+nothing gives an empty selection, with a warning: the watched lines
+disappearing is reported as a change.
+
 ### Notification Options
 
 | Option | Description | Default |
@@ -171,13 +187,23 @@ web-watcher [options] <url>
 | `--telegram-token <token>` | Telegram bot token | — |
 | `--telegram-chat <chat_id>` | Telegram chat ID | — |
 
+Telegram needs both the token and the chat ID. Each option has an environment
+variable (below) that keeps the secret out of your shell history and crontab;
+the option wins when both are set. Webhook URLs and the bot token reach curl
+through a config read on stdin, so they never show up in `ps`.
+
 Webhook calls fail loudly: an HTTP error from Slack, Discord or Telegram is reported with a `[WARN]` line instead of being ignored. Messages are sent as plain text, so URLs containing `_`, `*` or `&` are delivered unchanged.
 
 ### Environment Variables
 
 | Variable | Description | Default |
 |---|---|---|
+| `WW_SLACK_WEBHOOK` | Slack incoming webhook URL (same as `--slack`) | — |
+| `WW_DISCORD_WEBHOOK` | Discord webhook URL (same as `--discord`) | — |
+| `WW_TELEGRAM_TOKEN` | Telegram bot token (same as `--telegram-token`) | — |
+| `WW_TELEGRAM_CHAT_ID` | Telegram chat ID (same as `--telegram-chat`) | — |
 | `WW_TELEGRAM_API` | Base URL of the Telegram Bot API (useful for proxies or tests) | `https://api.telegram.org` |
+| `NO_COLOR` | Any non-empty value disables colors, like `--no-color` ([no-color.org](https://no-color.org)) | — |
 | `WW_HTML_STRIPPER` | Force the HTML-to-text implementation: `webindex`, `perl`, or `sed` | `webindex` if installed → `perl` if available → `sed` |
 
 `webindex` is preferred for balanced nested tags, charset detection, and main-content isolation. The `perl` and `sed` backends use regex-based stripping and a sed/awk scanner, respectively, without balancing nested tags: nested `<nav>` blocks are cut at the first `</nav>`.
@@ -189,17 +215,20 @@ Webhook calls fail loudly: an HTTP error from Slack, Discord or Telegram is repo
 | `-l, --log <file>` | Log changes to file | — |
 | `--snapshot-dir <dir>` | Save response snapshots | — |
 | `--diff` | Show unified diff on change | disabled |
-| `--no-sound` | Disable terminal bell | enabled |
+| `--no-sound` | Disable the terminal bell and the macOS notification sound | enabled |
 | `-q, --quiet` | Only show changes | disabled |
 | `-v, --verbose` | Debug output | disabled |
 | `--no-color` | Disable colors | enabled |
+
+Colors and the `Next check in…` countdown only appear when stdout is a
+terminal: a log file, a cron mail or an agent transcript gets plain lines.
 
 ### Modes Explained
 
 | Mode | Behavior |
 |---|---|
 | `auto` | Looks at `Content-Type` header: JSON → `api`, HTML → `website` |
-| `api` | Compares raw response body (JSON, XML, plain text) |
+| `api` | Compares the response body (JSON, XML, plain text); JSON is normalized one field per line |
 | `website` | Strips HTML tags, normalizes whitespace, compares text content |
 
 In website mode, the compared text has one line per block (paragraph,
@@ -207,6 +236,13 @@ list item, table cell, heading…). The change percentage is the share of these
 lines that differ. Source line breaks become spaces, including inside `<pre>`
 blocks; `<br>` starts a new line. Page chrome (nav, header, footer, aside) and
 cookie-banner lines are removed by default; use `--full-page` to keep them.
+
+In api mode without `--filter`, a response with a JSON Content-Type is passed
+through `jq .` when jq 1.7 or newer is installed: one field per line, key
+order kept, so a change in minified JSON is measured per field rather than as
+100%. A body jq cannot parse is compared as is. Older jq versions round large
+numbers (`1234567890123456789` becomes `1234567890123456800`), which could hide
+a change, so with them the response is compared as served.
 
 ## Examples
 
@@ -282,8 +318,12 @@ With a threshold, a minor change below it does not replace the stored baseline, 
 Exit codes for `--once` mode:
 
 - `0` — No change detected, change below threshold, or first run
-- `1` — Fetch error
+- `1` — Fetch error, `--filter` failing on the response, or invalid option
 - `2` — Change detected (meeting the threshold, if set)
+- `130` / `143` — Interrupted by SIGINT / SIGTERM before the check finished
+
+In continuous mode, Ctrl+C or SIGTERM stops the watch at once, even during the
+interval or a retry delay, and exits 0.
 
 With `--max-runs`, the exit code is `1` if no fetch ever succeeded, otherwise `0`.
 
@@ -378,9 +418,43 @@ Pass your Telegram bot token and chat ID with `--telegram-token` and `--telegram
   -i 30 https://api.example.com/data
 ```
 
+### Keeping secrets out of the command line
+
+Every webhook option has an environment variable, handy in a crontab or a
+service file that should not hold the secret inline:
+
+```bash
+export WW_SLACK_WEBHOOK=https://hooks.slack.com/services/T.../B.../xxx
+export WW_TELEGRAM_TOKEN=123456:ABC-DEF WW_TELEGRAM_CHAT_ID=987654321
+./script.sh -i 30 https://api.example.com/data
+```
+
 ## Upgrading
 
-After upgrading to this version, an existing `--baseline-file` captured by an older version in
+### To 1.5.0
+
+JSON responses are now normalized with `jq .` before comparing (in `api` mode,
+without `--filter`, when the Content-Type is JSON and jq 1.7+ is installed): one
+field per line, key order kept. An existing `--baseline-file` holding a JSON
+response captured by an older version will be reported as changed exactly once,
+then compared field by field. Minified JSON no longer counts every change as 100%.
+
+Other behavior changes:
+
+- A `--filter` that fails on a response is a failed check (exit 1, baseline
+  kept) instead of a comparison of the raw body.
+- A `--selector` with no match compares an empty selection instead of the whole
+  page.
+- A continuous watch resumes a non-empty `--baseline-file` instead of capturing
+  a fresh baseline.
+- An interrupted `--once` check exits 130 (SIGINT) or 143 (SIGTERM) instead of 0.
+- `--threshold` above 100, a Telegram token without a chat ID (or the reverse),
+  and an invalid `--filter` or `--selector` are rejected at startup.
+- `--no-sound` also silences the macOS notification.
+
+### To 1.2.0
+
+An existing `--baseline-file` captured by an older version in
 website mode will be reported as changed exactly once because the stored text
 representation changed from one word per line to one line per block. The change
 percentage is now per text line. `<pre>`
@@ -397,7 +471,7 @@ blocks lose their internal line breaks.
 
 ## Tests
 
-The test suite needs `python3` (it serves fixtures from a local HTTP server, no network access required) and runs every test under `bash` from your PATH plus `/bin/bash`, and under the `C` locale plus `fr_FR.UTF-8` when it is installed (to catch decimal-comma formatting bugs):
+The test suite needs `python3` (it serves fixtures from a local HTTP server, no network access required) and runs every test under `bash` from your PATH plus `/bin/bash`, and under the `C` locale plus `fr_FR.UTF-8` when it is installed (to catch decimal-comma formatting bugs). It also uses `jq`, `perl` (to deliver a real SIGINT) and `script(1)` (to run the CLI on a pseudo-terminal):
 
 ```bash
 bash tests/run.sh              # whole suite

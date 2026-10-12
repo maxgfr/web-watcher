@@ -40,7 +40,9 @@ SNAPSHOT_DIR=""
 VERBOSE=false
 QUIET=false
 SOUND=true
-NO_COLOR=false
+# --no-color, or a non-empty NO_COLOR in the environment (https://no-color.org)
+COLOR_OFF=false
+[ -n "${NO_COLOR:-}" ] && COLOR_OFF=true
 FOLLOW_REDIRECTS=true
 INSECURE=false
 SHOW_DIFF=false
@@ -50,14 +52,20 @@ STRIP_HTML=false
 FULL_PAGE=false
 HAS_DIFF=false
 BASELINE_FILE=""
-SLACK_WEBHOOK=""
-DISCORD_WEBHOOK=""
-TELEGRAM_TOKEN=""
-TELEGRAM_CHAT_ID=""
+# Webhook secrets can come from the environment, out of argv and shell
+# history; the command-line options take precedence.
+SLACK_WEBHOOK="${WW_SLACK_WEBHOOK:-}"
+DISCORD_WEBHOOK="${WW_DISCORD_WEBHOOK:-}"
+TELEGRAM_TOKEN="${WW_TELEGRAM_TOKEN:-}"
+TELEGRAM_CHAT_ID="${WW_TELEGRAM_CHAT_ID:-}"
+SLEEP_PID=""
+WORK_DIR=""
+IS_TTY=false
+[ -t 1 ] && IS_TTY=true
 
 # --- Colors ---
 setup_colors() {
-    if [ -t 1 ] && [ "$NO_COLOR" = false ]; then
+    if [ -t 1 ] && [ "$COLOR_OFF" = false ]; then
         RED='\033[0;31m'
         GREEN='\033[0;32m'
         BLUE='\033[0;34m'
@@ -75,7 +83,10 @@ setup_colors() {
 # --- Helper Functions ---
 
 log_info() {
-    [ "$QUIET" = true ] && return
+    # "return 0", not a bare "return": called from a trap handler, a bare
+    # return reports the status from before the trap (143 after an
+    # interrupted wait on bash 5.2), and set -e would abort the handler.
+    [ "$QUIET" = true ] && return 0
     printf "${BLUE}[INFO]${NC} %s\n" "$1"
 }
 
@@ -101,6 +112,12 @@ log_verbose() {
     fi
 }
 
+# byte_length <string> — length in bytes, not characters, whatever the locale
+byte_length() {
+    local LC_ALL=C
+    printf '%s' "${#1}"
+}
+
 log_to_file() {
     if [ -n "$LOG_FILE" ]; then
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$LOG_FILE"
@@ -118,27 +135,40 @@ send_notification() {
         printf '\a'
     fi
 
-    # OS-level notification
+    # Always print to terminal, first: a slow or failing webhook must not
+    # delay the report. Colors go through %b, data through %s, so a
+    # backslash in the URL or the message is printed as is.
+    echo ""
+    printf '%b%s%b\n' "${RED}${BOLD}" "╔══════════════════════════════════════════════════════════════╗" "$NC"
+    printf '%b%s%b\n' "${RED}${BOLD}" "║  🔔  CHANGE DETECTED                                         ║" "$NC"
+    printf '%b%s%b\n' "${RED}${BOLD}" "╚══════════════════════════════════════════════════════════════╝" "$NC"
+    printf '  %bURL:%b  %s\n' "$BOLD" "$NC" "$URL"
+    printf '  %bTime:%b %s\n' "$BOLD" "$NC" "$(date '+%Y-%m-%d %H:%M:%S')"
+    printf '  %bInfo:%b %s\n' "$BOLD" "$NC" "$message"
+    echo ""
+
+    # OS-level notification (--no-sound silences it too)
     if [[ "$OSTYPE" == "darwin"* ]]; then
-        osascript -e "display notification \"$(applescript_escape "$message")\" with title \"$(applescript_escape "$title")\" sound name \"Glass\"" 2>/dev/null || true
+        local script
+        script="display notification \"$(applescript_escape "$message")\" with title \"$(applescript_escape "$title")\""
+        if [ "$SOUND" = true ]; then
+            script="$script sound name \"Glass\""
+        fi
+        osascript -e "$script" 2>/dev/null || true
     elif command -v notify-send &>/dev/null; then
         notify-send "$title" "$message" 2>/dev/null || true
     fi
 
     # Webhook notifications
-    [ -n "$SLACK_WEBHOOK" ] && send_slack "$title" "$message"
-    [ -n "$DISCORD_WEBHOOK" ] && send_discord "$title" "$message"
-    [ -n "$TELEGRAM_TOKEN" ] && [ -n "$TELEGRAM_CHAT_ID" ] && send_telegram "$title" "$message"
-
-    # Always print to terminal
-    echo ""
-    echo -e "${RED}${BOLD}╔══════════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${RED}${BOLD}║  🔔  CHANGE DETECTED                                        ║${NC}"
-    echo -e "${RED}${BOLD}╚══════════════════════════════════════════════════════════════╝${NC}"
-    echo -e "  ${BOLD}URL:${NC}  $URL"
-    echo -e "  ${BOLD}Time:${NC} $(date '+%Y-%m-%d %H:%M:%S')"
-    echo -e "  ${BOLD}Info:${NC} $message"
-    echo ""
+    if [ -n "$SLACK_WEBHOOK" ]; then
+        send_slack "$title" "$message"
+    fi
+    if [ -n "$DISCORD_WEBHOOK" ]; then
+        send_discord "$title" "$message"
+    fi
+    if [ -n "$TELEGRAM_TOKEN" ] && [ -n "$TELEGRAM_CHAT_ID" ]; then
+        send_telegram "$title" "$message"
+    fi
 }
 
 # --- Webhook Notifications ---
@@ -170,12 +200,32 @@ json_escape() {
     printf '"%s"' "$s"
 }
 
+# Print $1 as a double-quoted curl config value (curl -K syntax).
+curl_config_quote() {
+    local s="$1"
+    s=${s//\\/\\\\}
+    s=${s//\"/\\\"}
+    s=${s//$'\n'/\\n}
+    s=${s//$'\r'/\\r}
+    s=${s//$'\t'/\\t}
+    printf '"%s"' "$s"
+}
+
+# curl_secret_url <url> [curl options...] — run curl on a URL that holds a
+# secret (webhook, bot token). The URL goes through a config read on stdin,
+# so it never shows up in the process list.
+curl_secret_url() {
+    local url="$1"
+    shift
+    printf 'url = %s\n' "$(curl_config_quote "$url")" | curl -K - "$@"
+}
+
 # POST a JSON document to a webhook. -f makes HTTP 4xx/5xx a failure so the
 # caller can report it instead of silently losing the notification.
 post_json() {
     local url="$1" payload="$2"
-    curl -fs -X POST -H 'Content-Type: application/json' --max-time "$TIMEOUT" \
-        -d "$payload" -- "$url" >/dev/null 2>&1
+    curl_secret_url "$url" -fs -X POST -H 'Content-Type: application/json' --max-time "$TIMEOUT" \
+        -d "$payload" >/dev/null 2>&1
 }
 
 send_slack() {
@@ -196,16 +246,16 @@ send_telegram() {
     # Fields are url-encoded (a "&" in the URL would otherwise start a new
     # parameter) and sent as plain text: no parse_mode, so "_" and "*" in URLs
     # need no escaping.
-    curl -fs -X POST --max-time "$TIMEOUT" \
+    curl_secret_url "${api}/bot${TELEGRAM_TOKEN}/sendMessage" -fs -X POST --max-time "$TIMEOUT" \
         --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
         --data-urlencode "text=${title}"$'\n'"${message}"$'\n'"${URL}" \
-        -- "${api}/bot${TELEGRAM_TOKEN}/sendMessage" >/dev/null 2>&1 || log_warn "Telegram notification failed"
+        >/dev/null 2>&1 || log_warn "Telegram notification failed"
 }
 
 # --- Banner ---
 
 print_banner() {
-    [ "$QUIET" = true ] && return
+    [ "$QUIET" = true ] && return 0
     echo -e "${CYAN}"
     echo " ██╗    ██╗███████╗██████╗       ██╗    ██╗ █████╗ ████████╗ ██████╗██╗  ██╗███████╗██████╗ "
     echo " ██║    ██║██╔════╝██╔══██╗      ██║    ██║██╔══██╗╚══██╔══╝██╔════╝██║  ██║██╔════╝██╔══██╗"
@@ -240,20 +290,24 @@ print_usage() {
     echo ""
     echo "Watch Options:"
     echo "  -i, --interval <secs>       Seconds between checks (default: 30)"
-    echo "  -p, --threshold <percent>   Min change % to trigger notification (default: 0 = any change)"
+    echo "  -p, --threshold <percent>   Min change % (0-100) to trigger notification (default: 0 = any change)"
     echo "  -n, --max-runs <num>        Stop after N checks (0 = unlimited, default: 0)"
     echo "  --once                      Run a single check then exit (useful for cron)"
-    echo "  --baseline-file <file>      Persist baseline to disk (required for --once to detect changes)"
-    echo "  --retries <num>             Number of retries on failure (default: 3)"
-    echo "  --retry-delay <secs>        Delay between retries in seconds (default: 5)"
+    echo "                              Exit: 0 no change, 1 error, 2 change, 130/143 interrupted"
+    echo "  --baseline-file <file>      Persist baseline to disk; resumed on the next run"
+    echo "                              (required for --once to detect changes)"
+    echo "  --retries <num>             Attempts per check, the first included (default: 3)"
+    echo "  --retry-delay <secs>        Fixed delay between attempts in seconds (default: 5)"
     echo ""
     echo "Content Options:"
     echo "  -m, --mode <mode>           Watch mode: api, website, auto (default: auto)"
-    echo "                              api     = compare raw response (JSON, XML, etc.)"
+    echo "                              api     = compare the body (JSON, XML, etc.; JSON one field per line with jq 1.7+)"
     echo "                              website = extract text content, strip HTML tags"
     echo "                              auto    = detect from Content-Type header"
-    echo "  -f, --filter <jq_expr>      jq filter for JSON responses (e.g., '.data.price')"
-    echo "  -s, --selector <pattern>    Grep pattern to extract specific content from HTML"
+    echo "  -f, --filter <jq_expr>      jq filter for JSON responses (e.g., '.data.price');"
+    echo "                              a response it cannot parse fails the check"
+    echo "  -s, --selector <pattern>    Grep pattern to extract specific content from HTML;"
+    echo "                              no match compares an empty selection"
     echo "  --strip-html                Force HTML tag stripping (useful with --mode api)"
     echo "  --full-page                 Keep navigation, header, footer, aside and cookie-banner text (website mode)"
     echo "  --ignore <regex>            Drop lines matching this pattern before comparing (repeatable)"
@@ -262,16 +316,18 @@ print_usage() {
     echo "  --slack <url>               Slack incoming webhook URL"
     echo "  --discord <url>             Discord webhook URL"
     echo "  --telegram-token <token>    Telegram bot token"
-    echo "  --telegram-chat <chat_id>   Telegram chat ID"
+    echo "  --telegram-chat <chat_id>   Telegram chat ID (required with --telegram-token)"
+    echo "                              Defaults from WW_SLACK_WEBHOOK, WW_DISCORD_WEBHOOK,"
+    echo "                              WW_TELEGRAM_TOKEN, WW_TELEGRAM_CHAT_ID (keeps secrets out of argv)"
     echo ""
     echo "Output Options:"
     echo "  -l, --log <file>            Log changes to a file"
     echo "  --snapshot-dir <dir>        Save snapshots of each response"
     echo "  --diff                      Show unified diff of changes"
-    echo "  --no-sound                  Disable terminal bell on change"
+    echo "  --no-sound                  Disable terminal bell and macOS notification sound"
     echo "  -q, --quiet                 Suppress info output (only show changes)"
     echo "  -v, --verbose               Verbose debug output"
-    echo "  --no-color                  Disable colored output"
+    echo "  --no-color                  Disable colored output (or set NO_COLOR)"
     echo "  -h, --help                  Show this help message"
     echo "  --version                   Show version"
     echo ""
@@ -308,14 +364,17 @@ print_usage() {
 # --- Dependency Check ---
 
 check_dependencies() {
-    local missing=()
+    # Package names (for the install command) and reasons (for the message)
+    local missing=() reasons=()
 
     if ! command -v curl &>/dev/null; then
         missing+=("curl")
+        reasons+=("curl")
     fi
 
     if [ -n "$JQ_FILTER" ] && ! command -v jq &>/dev/null; then
-        missing+=("jq (required for --filter)")
+        missing+=("jq")
+        reasons+=("jq (required for --filter)")
     fi
 
     if command -v diff &>/dev/null; then
@@ -325,7 +384,11 @@ check_dependencies() {
     fi
 
     if [ ${#missing[@]} -gt 0 ]; then
-        log_error "Missing required dependencies: ${missing[*]}"
+        local joined="" r
+        for r in "${reasons[@]}"; do
+            joined="${joined:+$joined, }$r"
+        done
+        log_error "Missing required dependencies: $joined"
         echo ""
         echo "Install them with:"
         if [[ "$OSTYPE" == "darwin"* ]]; then
@@ -399,8 +462,10 @@ parse_args() {
                 ;;
             -p|--threshold)
                 THRESHOLD="${2:?'--threshold requires a value'}"
-                if ! [[ "$THRESHOLD" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
-                    log_error "Threshold must be a number (percentage)"
+                # Above 100% no change could ever be notified.
+                if ! [[ "$THRESHOLD" =~ ^[0-9]+(\.[0-9]+)?$ ]] ||
+                    [ "$(LC_ALL=C awk -v t="$THRESHOLD" 'BEGIN { print (t > 100) ? 1 : 0 }')" = 1 ]; then
+                    log_error "Threshold must be a number between 0 and 100 (got '$THRESHOLD')"
                     exit 1
                 fi
                 shift 2
@@ -442,6 +507,13 @@ parse_args() {
                 ;;
             -s|--selector)
                 SELECTOR="${2:?'--selector requires a value'}"
+                local rc=0
+                # Same grep flags as process_content: exit 2 means a bad pattern.
+                printf '' | grep -ai -e "$SELECTOR" >/dev/null 2>&1 || rc=$?
+                if [ "$rc" -gt 1 ]; then
+                    log_error "--selector: invalid pattern '$SELECTOR'"
+                    exit 1
+                fi
                 shift 2
                 ;;
             --strip-html)
@@ -503,7 +575,7 @@ parse_args() {
                 shift
                 ;;
             --no-color)
-                NO_COLOR=true
+                COLOR_OFF=true
                 shift
                 ;;
             -h|--help)
@@ -538,10 +610,60 @@ parse_args() {
         exit 1
     fi
 
-    # Validate URL scheme
-    if [[ ! "$URL" =~ ^https?:// ]]; then
+    # Validate URL scheme (case-insensitive, as curl treats it)
+    if [[ ! "$URL" =~ ^[Hh][Tt][Tt][Pp]([Ss])?:// ]]; then
         log_error "Invalid URL: '$URL' — must start with http:// or https://"
         exit 1
+    fi
+
+    # One Telegram setting without the other would be silently ignored.
+    if { [ -n "$TELEGRAM_TOKEN" ] && [ -z "$TELEGRAM_CHAT_ID" ]; } ||
+        { [ -z "$TELEGRAM_TOKEN" ] && [ -n "$TELEGRAM_CHAT_ID" ]; }; then
+        log_error "Telegram needs both a bot token and a chat ID (--telegram-token and --telegram-chat)"
+        exit 1
+    fi
+}
+
+# validate_jq_filter — compile --filter without running it (needs jq, so it
+# runs after check_dependencies). jq exits 3 on a compile error.
+validate_jq_filter() {
+    [ -n "$JQ_FILTER" ] || return 0
+    local err rc=0
+    err=$(jq -n "if false then ($JQ_FILTER) else empty end" 2>&1 >/dev/null) || rc=$?
+    if [ "$rc" -ne 0 ]; then
+        log_error "--filter: invalid jq expression '$JQ_FILTER'"
+        [ -n "$err" ] && printf '%s\n' "$err" | head -3 >&2
+        exit 1
+    fi
+}
+
+# prepare_parent_dir <option> <file> — create the directory holding <file>
+# and make sure it is writable, so a bad path fails before the first fetch
+# instead of crashing the watcher later.
+prepare_parent_dir() {
+    local option="$1" file="$2" dir
+    dir="${file%/*}"
+    [ "$dir" = "$file" ] && dir="."
+    [ -z "$dir" ] && dir="/"
+    if ! mkdir -p -- "$dir" 2>/dev/null || [ ! -d "$dir" ] || [ ! -w "$dir" ] ||
+        { [ -e "$file" ] && [ ! -w "$file" ]; }; then
+        log_error "$option: cannot write '$file'"
+        exit 1
+    fi
+}
+
+prepare_output_paths() {
+    if [ -n "$LOG_FILE" ]; then
+        prepare_parent_dir "--log" "$LOG_FILE"
+    fi
+    if [ -n "$BASELINE_FILE" ]; then
+        prepare_parent_dir "--baseline-file" "$BASELINE_FILE"
+    fi
+    if [ -n "$SNAPSHOT_DIR" ]; then
+        if ! mkdir -p -- "$SNAPSHOT_DIR" 2>/dev/null || [ ! -w "$SNAPSHOT_DIR" ]; then
+            log_error "--snapshot-dir: cannot write '$SNAPSHOT_DIR'"
+            exit 1
+        fi
     fi
 }
 
@@ -610,26 +732,26 @@ fetch_url() {
             log_warn "Request failed (attempt $attempt/$RETRIES)"
             if [ "$attempt" -lt "$RETRIES" ]; then
                 log_verbose "Retrying in ${RETRY_DELAY}s..."
-                sleep "$RETRY_DELAY"
+                wait_sleep "$RETRY_DELAY"
             fi
             attempt=$((attempt + 1))
             continue
         }
 
-        # Parse response using our custom delimiters
-        local http_code content_type response
-
-        # grep -a: a body with bytes that are not valid in the current locale
-        # would otherwise be reported as "Binary file" instead of passed through.
-        http_code=$(printf '%s\n' "$raw_output" | grep -a "^${RESPONSE_DELIM}HTTP_CODE:" | sed "s/^${RESPONSE_DELIM}HTTP_CODE://")
-        content_type=$(printf '%s\n' "$raw_output" | grep -a "^${RESPONSE_DELIM}CONTENT_TYPE:" | sed "s/^${RESPONSE_DELIM}CONTENT_TYPE://")
-        response=$(printf '%s\n' "$raw_output" | grep -av "^${RESPONSE_DELIM}")
+        # Parse the trailer curl appends after the body. Only its last
+        # occurrence counts, so a body line that happens to start with the
+        # delimiter is kept as content. Parameter expansion, no subprocess.
+        local http_code content_type response meta
+        meta="${raw_output##*"$RESPONSE_DELIM"HTTP_CODE:}"
+        http_code="${meta%%$'\n'*}"
+        content_type="${meta#*"$RESPONSE_DELIM"CONTENT_TYPE:}"
+        response="${raw_output%$'\n'"$RESPONSE_DELIM"HTTP_CODE:*}"
 
         # Check HTTP status
         if [[ "$http_code" =~ ^[45] ]]; then
             log_warn "HTTP $http_code received (attempt $attempt/$RETRIES)"
             if [ "$attempt" -lt "$RETRIES" ]; then
-                sleep "$RETRY_DELAY"
+                wait_sleep "$RETRY_DELAY"
             fi
             attempt=$((attempt + 1))
             continue
@@ -651,6 +773,21 @@ fetch_url() {
 
 # --- Content Processing ---
 
+# content_type_is <json|html> <content_type> — case-insensitive Content-Type
+# test, in-process (no echo | grep per check).
+content_type_is() {
+    local re rc=0
+    case "$1" in
+        json) re='(application|text)/json|application/[^;]*\+json' ;;
+        html) re='text/html|application/xhtml' ;;
+        *) return 1 ;;
+    esac
+    shopt -s nocasematch
+    [[ "$2" =~ $re ]] || rc=1
+    shopt -u nocasematch
+    return "$rc"
+}
+
 detect_mode() {
     local content_type="$1"
 
@@ -659,9 +796,9 @@ detect_mode() {
         return
     fi
 
-    if echo "$content_type" | grep -qi 'application/json\|text/json\|application/.*+json'; then
+    if content_type_is json "$content_type"; then
         echo "api"
-    elif echo "$content_type" | grep -qi 'text/html\|application/xhtml'; then
+    elif content_type_is html "$content_type"; then
         echo "website"
     else
         echo "api"
@@ -869,11 +1006,10 @@ resolve_html_stripper() {
 }
 
 strip_html_tags_webindex() {
-    local tmp output rc=0 fallback=perl
-    tmp=$(mktemp "${TMPDIR:-/tmp}/ww.XXXXXX") || return $?
-    mv "$tmp" "$tmp.html" || { rc=$?; rm -f "$tmp"; return "$rc"; }
-    tmp="$tmp.html"
-    cat > "$tmp" || { rc=$?; rm -f "$tmp"; return "$rc"; }
+    # main creates WORK_DIR before stripping and the EXIT trap removes it, so
+    # an interrupted extraction leaves no file behind.
+    local tmp="${WORK_DIR:?}/page.html" output rc=0 fallback=perl
+    cat > "$tmp" || return $?
     if [ "$FULL_PAGE" = true ]; then
         output=$(webindex extract "$tmp" --full-page) || rc=$?
     else
@@ -951,10 +1087,29 @@ apply_ignore_patterns() {
     fi
 }
 
+# setup_json_normalize — enable `jq .` normalization only with a jq that keeps
+# number literals as written (1.7+). jq 1.6 prints numbers as doubles:
+# 1234567890123456789 and ...790 both become ...800, which would hide a change.
+JSON_NORMALIZE=false
+setup_json_normalize() {
+    command -v jq >/dev/null 2>&1 || return 0
+    if [ "$(printf '1234567890123456789\n' | jq . 2>/dev/null)" = 1234567890123456789 ]; then
+        JSON_NORMALIZE=true
+    else
+        log_verbose "jq rounds large numbers (jq < 1.7): JSON responses compared as is"
+    fi
+}
+
+# Exit status of process_content when --filter fails on a response.
+FILTER_FAILED_RC=3
+
+# process_content <content> <mode> — print the text to compare. Returns
+# FILTER_FAILED_RC when jq fails (an HTML error page served with a 200, say):
+# the check fails and the baseline is kept, rather than comparing raw bytes.
 process_content() {
     local content="$1"
     local resolved_mode="$2"
-    local fallback=false
+    local content_type="${3:-}"
 
     # Apply jq filter for JSON
     # printf rather than echo throughout: a response consisting of "-n" or
@@ -964,24 +1119,35 @@ process_content() {
         if filtered=$(printf '%s\n' "$content" | jq -r "$JQ_FILTER" 2>/dev/null); then
             content="$filtered"
         else
-            log_warn "jq filter failed, using raw content"
-            fallback=true
+            log_error "jq filter failed on this response (not JSON?); baseline kept"
+            return "$FILTER_FAILED_RC"
+        fi
+    elif [ "$JSON_NORMALIZE" = true ] && [ "$resolved_mode" = api ] && content_type_is json "$content_type"; then
+        # One field per line (key order kept), so minified JSON yields a
+        # meaningful change percentage. A body that is not JSON stays raw.
+        local normalized
+        if normalized=$(printf '%s\n' "$content" | jq . 2>/dev/null); then
+            content="$normalized"
         fi
     fi
 
-    # Apply grep selector
-    if [ "$fallback" = false ] && [ -n "$SELECTOR" ]; then
-        local selected
-        if selected=$(printf '%s\n' "$content" | grep -ai "$SELECTOR" 2>/dev/null); then
-            content="$selected"
-        else
-            log_warn "Selector pattern not found, using full content"
-            fallback=true
+    # Apply grep selector. No match is an empty selection, compared as usual:
+    # the watched lines disappearing is itself a change.
+    if [ -n "$SELECTOR" ]; then
+        local selected rc=0
+        selected=$(printf '%s\n' "$content" | grep -ai -e "$SELECTOR" 2>/dev/null) || rc=$?
+        if [ "$rc" -gt 1 ]; then
+            log_error "selector failed (grep exit $rc)"
+            return 1
         fi
+        if [ "$rc" -eq 1 ]; then
+            log_warn "Selector pattern not found, comparing an empty selection"
+        fi
+        content="$selected"
     fi
 
-    # Strip HTML if website mode or forced
-    if [ "$fallback" = false ] && { [ "$resolved_mode" = "website" ] || [ "$STRIP_HTML" = true ]; }; then
+    # Strip HTML if website mode or forced (nothing to strip in an empty selection)
+    if [ -n "$content" ] && { [ "$resolved_mode" = "website" ] || [ "$STRIP_HTML" = true ]; }; then
         content=$(printf '%s\n' "$content" | strip_html_tags)
     fi
 
@@ -998,54 +1164,34 @@ calculate_change_percent() {
     local old="$1"
     local new="$2"
 
-    local old_len=${#old}
-    local new_len=${#new}
-
-    if [ "$old_len" -eq 0 ] && [ "$new_len" -eq 0 ]; then
+    if [ -z "$old" ] && [ -z "$new" ]; then
         echo "0"
         return
     fi
 
-    if [ "$old_len" -eq 0 ]; then
+    if [ -z "$old" ]; then
         echo "100"
         return
     fi
 
-    # Use diff to count changed lines
-    local old_lines new_lines changed_lines
-    old_lines=$(printf '%s\n' "$old" | wc -l | tr -d ' ')
-    new_lines=$(printf '%s\n' "$new" | wc -l | tr -d ' ')
-
-    if [ "$old_lines" -eq 0 ]; then
-        old_lines=1
-    fi
-
-    # Count differing lines (each side separately to avoid double-counting)
-    local diff_output removed_count added_count
-    diff_output=$(diff_lines "$old" "$new")
-    removed_count=$(printf '%s\n' "$diff_output" | grep -ac '^<' || true)
-    added_count=$(printf '%s\n' "$diff_output" | grep -ac '^>' || true)
-    if [ "$removed_count" -gt "$added_count" ]; then
-        changed_lines="$removed_count"
-    else
-        changed_lines="$added_count"
-    fi
-
-    # Percentage relative to total lines
-    local total_lines
-    if [ "$old_lines" -gt "$new_lines" ]; then
-        total_lines="$old_lines"
-    else
-        total_lines="$new_lines"
-    fi
-    if [ "$total_lines" -eq 0 ]; then
-        total_lines=1
-    fi
-
-    # Use awk for floating point. LC_ALL=C forces a decimal point: under a
-    # locale with a decimal comma (fr_FR, de_DE, ...) awk would print "9,09",
-    # which then breaks every numeric comparison made on the result.
-    LC_ALL=C awk -v c="$changed_lines" -v t="$total_lines" 'BEGIN { printf "%.2f", (c / t) * 100 }'
+    # One awk pass reads both sides (line totals), then their diff (lines
+    # removed "<" and added ">", counted separately to avoid double-counting).
+    # The percentage is relative to the longer side. LC_ALL=C forces a
+    # decimal point: under a locale with a decimal comma (fr_FR, de_DE, ...)
+    # awk would print "9,09", which then breaks every numeric comparison.
+    diff_lines "$old" "$new" | LC_ALL=C awk '
+        FNR == 1 { file++ }
+        file == 1 { old_lines++; next }
+        file == 2 { new_lines++; next }
+        /^</ { removed++ }
+        /^>/ { added++ }
+        END {
+            changed = (removed > added) ? removed : added
+            total = (old_lines > new_lines) ? old_lines : new_lines
+            if (total == 0) total = 1
+            printf "%.2f", (changed / total) * 100
+        }
+    ' <(printf '%s\n' "$old") <(printf '%s\n' "$new") -
 }
 
 # 0 (true) if change percentage $1 reaches threshold $2.
@@ -1096,53 +1242,59 @@ save_snapshot() {
 
 # --- Progress / Status ---
 
-print_watch_config() {
-    [ "$QUIET" = true ] && return
+# config_line <label> <value> — the value is user data, printed with %s so
+# its backslashes are not interpreted.
+config_line() {
+    printf '  %b%-12s%b%s\n' "$CYAN" "$1" "$NC" "$2"
+}
 
-    echo -e "${BOLD}Configuration:${NC}"
-    echo -e "  ${CYAN}URL:${NC}        $URL"
-    echo -e "  ${CYAN}Method:${NC}     $METHOD"
-    echo -e "  ${CYAN}Mode:${NC}       $MODE"
+print_watch_config() {
+    [ "$QUIET" = true ] && return 0
+
+    printf '%bConfiguration:%b\n' "$BOLD" "$NC"
+    config_line "URL:" "$URL"
+    config_line "Method:" "$METHOD"
+    config_line "Mode:" "$MODE"
     if [ "$MODE" = website ] || [ "$MODE" = auto ]; then
-        echo -e "  ${CYAN}Stripper:${NC}   $(resolve_html_stripper)"
+        config_line "Stripper:" "$(resolve_html_stripper)"
         if [ "$FULL_PAGE" = true ]; then
-            echo -e "  ${CYAN}Page:${NC}       full page"
+            config_line "Page:" "full page"
         else
-            echo -e "  ${CYAN}Page:${NC}       main content (use --full-page to keep chrome)"
+            config_line "Page:" "main content (use --full-page to keep chrome)"
         fi
     fi
-    echo -e "  ${CYAN}Interval:${NC}   ${INTERVAL}s"
+    config_line "Interval:" "${INTERVAL}s"
     if [ "$THRESHOLD" != "0" ]; then
-        echo -e "  ${CYAN}Threshold:${NC}  ${THRESHOLD}%"
+        config_line "Threshold:" "${THRESHOLD}%"
     else
-        echo -e "  ${CYAN}Threshold:${NC}  any change"
+        config_line "Threshold:" "any change"
     fi
     if [ ${#HEADERS[@]} -gt 0 ]; then
-        echo -e "  ${CYAN}Headers:${NC}    ${#HEADERS[@]} custom header(s)"
+        config_line "Headers:" "${#HEADERS[@]} custom header(s)"
     fi
     if [ -n "$JQ_FILTER" ]; then
-        echo -e "  ${CYAN}Filter:${NC}     $JQ_FILTER"
+        config_line "Filter:" "$JQ_FILTER"
     fi
     if [ -n "$SELECTOR" ]; then
-        echo -e "  ${CYAN}Selector:${NC}   $SELECTOR"
+        config_line "Selector:" "$SELECTOR"
     fi
     if [ ${#IGNORE_PATTERNS[@]} -gt 0 ]; then
-        echo -e "  ${CYAN}Ignore:${NC}     ${#IGNORE_PATTERNS[@]} pattern(s)"
+        config_line "Ignore:" "${#IGNORE_PATTERNS[@]} pattern(s)"
     fi
     if [ -n "$BODY" ]; then
-        echo -e "  ${CYAN}Body:${NC}       (${#BODY} bytes)"
+        config_line "Body:" "($(byte_length "$BODY") bytes)"
     fi
     if [ -n "$LOG_FILE" ]; then
-        echo -e "  ${CYAN}Log:${NC}        $LOG_FILE"
+        config_line "Log:" "$LOG_FILE"
     fi
     if [ -n "$SNAPSHOT_DIR" ]; then
-        echo -e "  ${CYAN}Snapshots:${NC}  $SNAPSHOT_DIR"
+        config_line "Snapshots:" "$SNAPSHOT_DIR"
     fi
     if [ -n "$BASELINE_FILE" ]; then
-        echo -e "  ${CYAN}Baseline:${NC}   $BASELINE_FILE"
+        config_line "Baseline:" "$BASELINE_FILE"
     fi
     if [ "$MAX_RUNS" -gt 0 ]; then
-        echo -e "  ${CYAN}Max runs:${NC}   $MAX_RUNS"
+        config_line "Max runs:" "$MAX_RUNS"
     fi
     # Notification channels
     local channels=()
@@ -1154,20 +1306,32 @@ print_watch_config() {
         for c in "${channels[@]}"; do
             joined="${joined:+$joined, }$c"
         done
-        echo -e "  ${CYAN}Notify:${NC}     $joined"
+        config_line "Notify:" "$joined"
     fi
     echo ""
 }
 
+# wait_sleep <secs> — sleep in the background and wait for it: a trapped
+# signal interrupts "wait" at once, where a foreground sleep would defer the
+# trap until the sleep ends.
+wait_sleep() {
+    sleep "$1" &
+    SLEEP_PID=$!
+    wait "$SLEEP_PID" || true
+    SLEEP_PID=""
+}
+
 print_countdown() {
     local remaining="$1"
-    if [ "$QUIET" = true ]; then
-        sleep "$remaining"
+    # A countdown redrawn with "\r" only makes sense on a terminal; in a log
+    # file, a cron mail or an agent transcript it is noise.
+    if [ "$QUIET" = true ] || [ "$IS_TTY" = false ]; then
+        wait_sleep "$remaining"
         return
     fi
     while [ "$remaining" -gt 0 ]; do
         printf "\r${DIM}  ⏳ Next check in %ds...  ${NC}" "$remaining"
-        sleep 1
+        wait_sleep 1
         remaining=$((remaining - 1))
     done
     printf "\r                                        \r"
@@ -1175,18 +1339,48 @@ print_countdown() {
 
 # --- Cleanup ---
 
+# ensure_work_dir — create the private scratch directory once, in the main
+# shell: an assignment made in a subshell would be lost and the dir leaked.
+ensure_work_dir() {
+    if [ -z "$WORK_DIR" ]; then
+        WORK_DIR=$(mktemp -d "${TMPDIR:-/tmp}/ww.XXXXXX")
+    fi
+}
+
+remove_work_dir() {
+    if [ -n "$WORK_DIR" ]; then
+        rm -rf -- "$WORK_DIR"
+    fi
+}
+
+# cleanup <exit_code> — signal handler. An interrupted --once check exits 130
+# (INT) or 143 (TERM) so a cron job or an agent cannot read it as "no change";
+# stopping a continuous watch is the normal way out and exits 0.
 cleanup() {
+    if [ -n "$SLEEP_PID" ]; then
+        kill "$SLEEP_PID" 2>/dev/null || true
+    fi
     echo ""
     log_info "Stopped watching. Goodbye!"
+    if [ "$ONCE" = true ]; then
+        exit "$1"
+    fi
     exit 0
 }
 
 # --- Main Watch Loop ---
 
 # persist_baseline <content> — write the current baseline to --baseline-file
+# Written to a temporary file in the same directory, then renamed: a crash or
+# a full disk mid-write cannot leave a truncated baseline behind.
 persist_baseline() {
     if [ -n "$BASELINE_FILE" ]; then
-        printf '%s\n' "$1" > "$BASELINE_FILE"
+        local tmp="${BASELINE_FILE}.tmp.$$"
+        if ! { printf '%s\n' "$1" > "$tmp" && mv -f -- "$tmp" "$BASELINE_FILE"; } 2>/dev/null; then
+            rm -f -- "$tmp"
+            log_error "Cannot write baseline file $BASELINE_FILE"
+            exit 1
+        fi
         log_verbose "Baseline saved to $BASELINE_FILE"
     fi
 }
@@ -1218,10 +1412,15 @@ main() {
 
     print_banner
     check_dependencies
+    validate_jq_filter
+    setup_json_normalize
+    prepare_output_paths
     print_watch_config
 
-    # Setup cleanup trap
-    trap cleanup SIGINT SIGTERM
+    # Setup cleanup traps
+    trap 'cleanup 130' INT
+    trap 'cleanup 143' TERM
+    trap remove_work_dir EXIT
 
     local previous_content=""
     local run_count=0
@@ -1249,31 +1448,60 @@ main() {
             print_countdown "$INTERVAL"
             continue
         fi
-        success_count=$((success_count + 1))
 
-        # Detect mode on first successful response
-        if [ -z "$resolved_mode" ]; then
-            resolved_mode=$(detect_mode "$LAST_CONTENT_TYPE")
-            log_verbose "Resolved mode: $resolved_mode"
+        # Detect mode from the first response that processes successfully, so
+        # an error page cannot lock in the wrong mode.
+        local mode="$resolved_mode"
+        if [ -z "$mode" ]; then
+            mode=$(detect_mode "$LAST_CONTENT_TYPE")
         fi
 
-        # Process content
-        local current_content
-        current_content=$(process_content "$LAST_RESPONSE" "$resolved_mode")
+        # webindex extraction needs a scratch file
+        if [ "$mode" = website ] || [ "$STRIP_HTML" = true ]; then
+            ensure_work_dir
+        fi
+
+        # Process content. A failed filter is a failed check, like a failed
+        # fetch: the baseline is kept and nothing is notified.
+        local current_content process_rc=0
+        current_content=$(process_content "$LAST_RESPONSE" "$mode" "$LAST_CONTENT_TYPE") || process_rc=$?
+        if [ "$process_rc" -eq "$FILTER_FAILED_RC" ]; then
+            log_to_file "FILTER_FAILED — jq filter failed on the response (HTTP $LAST_HTTP_CODE)"
+            if [ "$ONCE" = true ]; then
+                exit 1
+            fi
+            check_max_runs "$run_count" "$change_count" "$success_count"
+            print_countdown "$INTERVAL"
+            continue
+        elif [ "$process_rc" -ne 0 ]; then
+            exit 1
+        fi
+        success_count=$((success_count + 1))
+        if [ -z "$resolved_mode" ]; then
+            resolved_mode="$mode"
+            log_verbose "Resolved mode: $resolved_mode"
+        fi
 
         if [ "$first_run" = true ]; then
             first_run=false
 
-            # In --once mode, try to load previous baseline from file
-            if [ "$ONCE" = true ] && [ -n "$BASELINE_FILE" ] && [ -f "$BASELINE_FILE" ]; then
+            # Load a previous baseline from file, in --once and continuous mode
+            # alike, so a change made while no watcher ran is still reported.
+            # An empty file (pre-created with touch or mktemp) is no baseline.
+            if [ -n "$BASELINE_FILE" ] && [ -s "$BASELINE_FILE" ]; then
                 previous_content=$(cat "$BASELINE_FILE")
-                log_verbose "Loaded baseline from $BASELINE_FILE (${#previous_content} bytes)"
+                log_verbose "Loaded baseline from $BASELINE_FILE ($(byte_length "$previous_content") bytes)"
+                if [ "$ONCE" = false ]; then
+                    log_info "Resumed baseline from $BASELINE_FILE"
+                fi
                 # Don't skip comparison — fall through to compare
             else
                 previous_content="$current_content"
                 save_snapshot "$current_content" "initial"
-                log_success "Baseline captured (HTTP $LAST_HTTP_CODE, ${#current_content} bytes, mode: $resolved_mode)"
-                log_to_file "BASELINE — HTTP $LAST_HTTP_CODE, ${#current_content} bytes"
+                local size
+                size=$(byte_length "$current_content")
+                log_success "Baseline captured (HTTP $LAST_HTTP_CODE, $size bytes, mode: $resolved_mode)"
+                log_to_file "BASELINE — HTTP $LAST_HTTP_CODE, $size bytes"
                 persist_baseline "$current_content"
 
                 if [ "$ONCE" = true ]; then
@@ -1293,8 +1521,13 @@ main() {
             local elapsed=$(( $(date +%s) - start_time ))
             local elapsed_fmt
             elapsed_fmt=$(printf '%02d:%02d:%02d' $((elapsed/3600)) $((elapsed%3600/60)) $((elapsed%60)))
-            [ "$QUIET" = false ] && printf "\r  ${DIM}[%s] Check #%d — No change (uptime: %s)${NC}\n" "$ts" "$run_count" "$elapsed_fmt"
-            log_verbose "No change (${#current_content} bytes)"
+            # "\r" overwrites the countdown, which is only drawn on a terminal.
+            local cr=""
+            [ "$IS_TTY" = true ] && cr=$'\r'
+            [ "$QUIET" = false ] && printf "%s  ${DIM}[%s] Check #%d — No change (uptime: %s)${NC}\n" "$cr" "$ts" "$run_count" "$elapsed_fmt"
+            if [ "$VERBOSE" = true ]; then
+                log_verbose "No change ($(byte_length "$current_content") bytes)"
+            fi
         else
             # Calculate change percentage
             local change_pct
