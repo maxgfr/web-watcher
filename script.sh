@@ -301,7 +301,7 @@ print_usage() {
     echo ""
     echo "Content Options:"
     echo "  -m, --mode <mode>           Watch mode: api, website, auto (default: auto)"
-    echo "                              api     = compare the body (JSON, XML, etc.; JSON one field per line)"
+    echo "                              api     = compare the body (JSON, XML, etc.; JSON one field per line with jq 1.7+)"
     echo "                              website = extract text content, strip HTML tags"
     echo "                              auto    = detect from Content-Type header"
     echo "  -f, --filter <jq_expr>      jq filter for JSON responses (e.g., '.data.price');"
@@ -1087,6 +1087,19 @@ apply_ignore_patterns() {
     fi
 }
 
+# setup_json_normalize — enable `jq .` normalization only with a jq that keeps
+# number literals as written (1.7+). jq 1.6 prints numbers as doubles:
+# 1234567890123456789 and ...790 both become ...800, which would hide a change.
+JSON_NORMALIZE=false
+setup_json_normalize() {
+    command -v jq >/dev/null 2>&1 || return 0
+    if [ "$(printf '1234567890123456789\n' | jq . 2>/dev/null)" = 1234567890123456789 ]; then
+        JSON_NORMALIZE=true
+    else
+        log_verbose "jq rounds large numbers (jq < 1.7): JSON responses compared as is"
+    fi
+}
+
 # Exit status of process_content when --filter fails on a response.
 FILTER_FAILED_RC=3
 
@@ -1109,7 +1122,7 @@ process_content() {
             log_error "jq filter failed on this response (not JSON?); baseline kept"
             return "$FILTER_FAILED_RC"
         fi
-    elif [ "$resolved_mode" = api ] && content_type_is json "$content_type" && command -v jq >/dev/null 2>&1; then
+    elif [ "$JSON_NORMALIZE" = true ] && [ "$resolved_mode" = api ] && content_type_is json "$content_type"; then
         # One field per line (key order kept), so minified JSON yields a
         # meaningful change percentage. A body that is not JSON stays raw.
         local normalized
@@ -1400,6 +1413,7 @@ main() {
     print_banner
     check_dependencies
     validate_jq_filter
+    setup_json_normalize
     prepare_output_paths
     print_watch_config
 

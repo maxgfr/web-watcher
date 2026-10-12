@@ -255,6 +255,23 @@ last_hook_body_is_json() {
     "$PYTHON" -c 'import json,sys; json.loads(json.load(open(sys.argv[1]))["body"])' "$latest" 2>/dev/null
 }
 
+# script.sh normalizes JSON with `jq .` only when jq keeps number literals
+# (1.7+, see setup_json_normalize); with an older jq, JSON is compared as
+# served. Same probe here, so expectations follow the installed jq.
+JQ_NORMALIZES=false
+if [ "$(printf '1234567890123456789\n' | jq . 2>/dev/null)" = 1234567890123456789 ]; then
+    JQ_NORMALIZES=true
+fi
+
+# The text script.sh compares for a served JSON file.
+as_compared_json() {
+    if [ "$JQ_NORMALIZES" = true ]; then jq . "$1"; else cat "$1"; fi
+}
+
+# Change percentage of the price edit in a.json: 1 line of 14 once
+# normalized, 1 of 11 as served.
+if [ "$JQ_NORMALIZES" = true ]; then A_JSON_PCT="7.14"; else A_JSON_PCT="9.09"; fi
+
 reset_fixtures() {
     rm -f "$SERVE"/* "$HOOKS"/* "$TMP/baseline"
     cp "$FIXTURES"/* "$SERVE/"
@@ -324,7 +341,7 @@ t_once_detects_change_and_updates_baseline() {
     assert_rc 2
     assert_contains "$OUT" "CHANGE DETECTED"
     assert_not_contains "$OUT" "syntax error"
-    assert_eq "$(cat "$TMP/baseline")" "$(jq . "$SERVE/a.json")"
+    assert_eq "$(cat "$TMP/baseline")" "$(as_compared_json "$SERVE/a.json")"
 }
 
 t_once_with_max_runs_keeps_exit_code() {
@@ -335,7 +352,7 @@ t_once_with_max_runs_keeps_exit_code() {
     ww --once -n 1 --baseline-file "$TMP/baseline" "$BASE/a.json"
     assert_rc 2
     assert_contains "$OUT" "CHANGE DETECTED"
-    assert_eq "$(cat "$TMP/baseline")" "$(jq . "$SERVE/a.json")"
+    assert_eq "$(cat "$TMP/baseline")" "$(as_compared_json "$SERVE/a.json")"
 }
 
 t_once_no_change_exits_zero() {
@@ -407,8 +424,7 @@ t_change_percent_uses_decimal_point() {
     sed 's/"price": 10/"price": 12/' "$FIXTURES/a.json" > "$SERVE/a.json"
     ww --once --baseline-file "$TMP/baseline" "$BASE/a.json"
     assert_rc 2
-    # 1 line out of 14 once the JSON is normalized with jq .
-    assert_contains "$OUT" "Change of 7.14% detected"
+    assert_contains "$OUT" "Change of ${A_JSON_PCT}% detected"
 }
 
 t_threshold_minor_change_not_notified() {
@@ -416,7 +432,7 @@ t_threshold_minor_change_not_notified() {
     sed 's/"price": 10/"price": 12/' "$FIXTURES/a.json" > "$SERVE/a.json"
     ww --once -p 50 --baseline-file "$TMP/baseline" "$BASE/a.json"
     assert_rc 0
-    assert_contains "$OUT" "Minor change (7.14% < 50% threshold)"
+    assert_contains "$OUT" "Minor change (${A_JSON_PCT}% < 50% threshold)"
     assert_not_contains "$OUT" "CHANGE DETECTED"
 }
 
@@ -428,7 +444,7 @@ t_once_threshold_keeps_baseline_until_notified() {
     ww --once -p 50 --baseline-file "$TMP/baseline" "$BASE/a.json"
     assert_rc 0
     assert_contains "$OUT" "Minor change"
-    assert_eq "$(cat "$TMP/baseline")" "$(jq . "$FIXTURES/a.json")"
+    assert_eq "$(cat "$TMP/baseline")" "$(as_compared_json "$FIXTURES/a.json")"
 
     ww --once -p 50 --baseline-file "$TMP/baseline" "$BASE/a.json"
     assert_rc 0
@@ -437,7 +453,7 @@ t_once_threshold_keeps_baseline_until_notified() {
     printf '{"totally": "different"}\n' > "$SERVE/a.json"
     ww --once -p 50 --baseline-file "$TMP/baseline" "$BASE/a.json"
     assert_rc 2
-    assert_eq "$(cat "$TMP/baseline")" "$(jq . "$SERVE/a.json")"
+    assert_eq "$(cat "$TMP/baseline")" "$(as_compared_json "$SERVE/a.json")"
 }
 
 t_threshold_major_change_notified() {
@@ -1148,7 +1164,7 @@ t_continuous_mode_updates_baseline_file_on_change() {
     wait_bg 10
     assert_rc 0
     assert_contains "$OUT" "CHANGE DETECTED"
-    assert_eq "$(cat "$TMP/baseline")" "$(jq . "$SERVE/a.json")"
+    assert_eq "$(cat "$TMP/baseline")" "$(as_compared_json "$SERVE/a.json")"
 }
 
 t_notify_channels_listed_with_separator() {
@@ -1444,6 +1460,10 @@ t_selector_disappearing_is_a_change() {
 }
 
 t_minified_json_change_percent_is_per_field() {
+    if [ "$JQ_NORMALIZES" = false ]; then
+        echo "  SKIP t_minified_json_change_percent_is_per_field (jq < 1.7: no JSON normalization)"
+        return
+    fi
     # Minified JSON is one line: without normalization any change is 100%.
     printf '{"a":1,"b":2,"c":3,"d":4}\n' > "$SERVE/m.json"
     ww --once --baseline-file "$TMP/baseline" "$BASE/m.json"
@@ -1462,6 +1482,10 @@ t_minified_json_change_percent_is_per_field() {
 }
 
 t_json_key_order_kept() {
+    if [ "$JQ_NORMALIZES" = false ]; then
+        echo "  SKIP t_json_key_order_kept (jq < 1.7: no JSON normalization)"
+        return
+    fi
     printf '{"z":1,"a":2}\n' > "$SERVE/order.json"
     ww --once --baseline-file "$TMP/baseline" "$BASE/order.json"
     assert_rc 0
@@ -1481,6 +1505,42 @@ t_json_with_html_body_kept_raw() {
     ww --once --baseline-file "$TMP/baseline" "$BASE/raw.txt"
     assert_rc 0
     assert_eq "$(cat "$TMP/baseline")" '{"a":1}'
+}
+
+t_json_large_integer_change_detected() {
+    # Normalization must never hide a change: jq 1.6 prints numbers as
+    # doubles, turning both IDs below into 1234567890123456800.
+    printf '{"id":1234567890123456789}\n' > "$SERVE/big.json"
+    ww --once --baseline-file "$TMP/baseline" "$BASE/big.json"
+    assert_rc 0
+    assert_contains "$(cat "$TMP/baseline")" "1234567890123456789"
+    printf '{"id":1234567890123456790}\n' > "$SERVE/big.json"
+    ww --once --baseline-file "$TMP/baseline" "$BASE/big.json"
+    assert_rc 2
+    assert_contains "$OUT" "CHANGE DETECTED"
+}
+
+t_json_kept_raw_with_lossy_jq() {
+    # A jq that rounds large integers (1.6 and older) is not used to normalize.
+    mkdir -p "$TMP/lossy"
+    cat > "$TMP/lossy/jq" <<'EOF'
+#!/bin/sh
+input=$(cat)
+if [ "$input" = 1234567890123456789 ]; then echo 1234567890123456800; exit 0; fi
+printf '%s\n' "$input" | exec "$WW_REAL_JQ" "$@"
+EOF
+    chmod +x "$TMP/lossy/jq"
+    WW_REAL_JQ="$(command -v jq)" PATH="$TMP/lossy:$PATH" \
+        ww --once --baseline-file "$TMP/baseline" "$BASE/a.json"
+    assert_rc 0
+    assert_eq "$(cat "$TMP/baseline")" "$(cat "$FIXTURES/a.json")"
+    # --filter still works with such a jq.
+    rm -f "$TMP/baseline"
+    WW_REAL_JQ="$(command -v jq)" PATH="$TMP/lossy:$PATH" \
+        ww --once -f .price --baseline-file "$TMP/baseline" "$BASE/a.json"
+    assert_rc 0
+    assert_eq "$(cat "$TMP/baseline")" "10"
+    rm -rf "$TMP/lossy"
 }
 
 t_json_kept_raw_without_jq() {
@@ -1505,7 +1565,7 @@ t_continuous_mode_resumes_baseline() {
     assert_contains "$OUT" "Resumed baseline from $TMP/baseline"
     assert_contains "$OUT" "CHANGE DETECTED"
     assert_not_contains "$OUT" "Baseline captured"
-    assert_eq "$(cat "$TMP/baseline")" "$(jq . "$SERVE/a.json")"
+    assert_eq "$(cat "$TMP/baseline")" "$(as_compared_json "$SERVE/a.json")"
 }
 
 t_webhooks_from_env_vars() {

@@ -53,7 +53,7 @@ sudo ln -s "$(pwd)/script.sh" /usr/local/bin/web-watcher
 
 ### Dependencies
 
-Only `curl` is required. `jq` is needed if you use the `--filter` option; when installed, it also normalizes JSON responses one field per line. In `website` mode, `webindex` is recommended for the most accurate HTML-to-text extraction (`brew install maxgfr/tap/webindex`); the Homebrew formula for `web-watcher` installs it automatically. `perl` (present on macOS and nearly every Linux distribution) is recommended as a fallback; without either tool, a sed/awk fallback is used. `python3` is only needed to run the test suite.
+Only `curl` is required. `jq` is needed if you use the `--filter` option; jq 1.7 or newer also normalizes JSON responses one field per line. In `website` mode, `webindex` is recommended for the most accurate HTML-to-text extraction (`brew install maxgfr/tap/webindex`); the Homebrew formula for `web-watcher` installs it automatically. `perl` (present on macOS and nearly every Linux distribution) is recommended as a fallback; without either tool, a sed/awk fallback is used. `python3` is only needed to run the test suite.
 
 **macOS:**
 ```bash
@@ -238,9 +238,11 @@ blocks; `<br>` starts a new line. Page chrome (nav, header, footer, aside) and
 cookie-banner lines are removed by default; use `--full-page` to keep them.
 
 In api mode without `--filter`, a response with a JSON Content-Type is passed
-through `jq .` when jq is installed: one field per line, key order kept, so a
-change in minified JSON is measured per field rather than as 100%. A body jq
-cannot parse is compared as is.
+through `jq .` when jq 1.7 or newer is installed: one field per line, key
+order kept, so a change in minified JSON is measured per field rather than as
+100%. A body jq cannot parse is compared as is. Older jq versions round large
+numbers (`1234567890123456789` becomes `1234567890123456800`), which could hide
+a change, so with them the response is compared as served.
 
 ## Examples
 
@@ -432,7 +434,7 @@ export WW_TELEGRAM_TOKEN=123456:ABC-DEF WW_TELEGRAM_CHAT_ID=987654321
 ### To 1.5.0
 
 JSON responses are now normalized with `jq .` before comparing (in `api` mode,
-without `--filter`, when the Content-Type is JSON and `jq` is installed): one
+without `--filter`, when the Content-Type is JSON and jq 1.7+ is installed): one
 field per line, key order kept. An existing `--baseline-file` holding a JSON
 response captured by an older version will be reported as changed exactly once,
 then compared field by field. Minified JSON no longer counts every change as 100%.
