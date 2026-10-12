@@ -40,7 +40,9 @@ SNAPSHOT_DIR=""
 VERBOSE=false
 QUIET=false
 SOUND=true
-NO_COLOR=false
+# --no-color, or a non-empty NO_COLOR in the environment (https://no-color.org)
+COLOR_OFF=false
+[ -n "${NO_COLOR:-}" ] && COLOR_OFF=true
 FOLLOW_REDIRECTS=true
 INSECURE=false
 SHOW_DIFF=false
@@ -63,7 +65,7 @@ IS_TTY=false
 
 # --- Colors ---
 setup_colors() {
-    if [ -t 1 ] && [ "$NO_COLOR" = false ]; then
+    if [ -t 1 ] && [ "$COLOR_OFF" = false ]; then
         RED='\033[0;31m'
         GREEN='\033[0;32m'
         BLUE='\033[0;34m'
@@ -567,7 +569,7 @@ parse_args() {
                 shift
                 ;;
             --no-color)
-                NO_COLOR=true
+                COLOR_OFF=true
                 shift
                 ;;
             -h|--help)

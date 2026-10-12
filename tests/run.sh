@@ -194,6 +194,24 @@ run_bg_int() {
     BG_PID=$!
 }
 
+# Run script.sh with stdout on a pseudo-terminal (script(1): BSD/macOS or
+# util-linux syntax), without the --no-color ww adds; sets OUT and RC.
+ww_tty() {
+    local cmd q arg
+    if script --version 2>/dev/null | grep -q util-linux; then
+        cmd="LC_ALL=$(printf '%q' "$LOC") $(printf '%q' "$SH") $(printf '%q' "$SCRIPT") --no-sound"
+        for arg in "$@"; do
+            printf -v q '%q' "$arg"
+            cmd="$cmd $q"
+        done
+        OUT=$(script -qec "$cmd" /dev/null < /dev/null 2>&1)
+        RC=$?
+    else
+        OUT=$(LC_ALL="$LOC" script -q /dev/null "$SH" "$SCRIPT" --no-sound "$@" < /dev/null 2>&1)
+        RC=$?
+    fi
+}
+
 # Wait (up to N seconds) for the background run's output to contain a string.
 wait_for_output() {
     local text="$1" max_seconds="$2" i=0
@@ -1634,6 +1652,36 @@ t_content_type_detection_is_case_insensitive() {
     assert_eq "$(WW_FN_DEPS=content_type_is ww_fn detect_mode 'application/json')" "website"
     if ww_fn content_type_is json 'APPLICATION/JSON'; then pass; else fail "uppercase JSON type not detected"; fi
     if ww_fn content_type_is json 'text/html'; then fail "HTML detected as JSON"; else pass; fi
+}
+
+t_no_color_env_respected() {
+    local esc
+    esc=$(printf '\033[')
+    # Control: on a terminal, colors are on by default.
+    ww_tty --once "$BASE/a.json"
+    assert_rc 0
+    assert_contains "$OUT" "Baseline captured"
+    assert_contains "$OUT" "$esc"
+
+    # https://no-color.org: any non-empty NO_COLOR disables colors.
+    NO_COLOR=1 ww_tty --once "$BASE/a.json"
+    assert_rc 0
+    assert_contains "$OUT" "Baseline captured"
+    assert_not_contains "$OUT" "$esc"
+
+    ww_tty --once --no-color "$BASE/a.json"
+    assert_rc 0
+    assert_not_contains "$OUT" "$esc"
+
+    # An empty NO_COLOR does not.
+    NO_COLOR= ww_tty --once "$BASE/a.json"
+    assert_contains "$OUT" "$esc"
+}
+
+t_countdown_shown_on_a_tty() {
+    ww_tty -i 2 -n 2 "$BASE/a.json"
+    assert_rc 0
+    assert_contains "$OUT" "Next check in"
 }
 
 # --- Runner -------------------------------------------------------------------
