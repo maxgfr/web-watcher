@@ -56,6 +56,8 @@ TELEGRAM_TOKEN=""
 TELEGRAM_CHAT_ID=""
 SLEEP_PID=""
 WORK_DIR=""
+IS_TTY=false
+[ -t 1 ] && IS_TTY=true
 
 # --- Colors ---
 setup_colors() {
@@ -132,14 +134,15 @@ send_notification() {
     [ -n "$DISCORD_WEBHOOK" ] && send_discord "$title" "$message"
     [ -n "$TELEGRAM_TOKEN" ] && [ -n "$TELEGRAM_CHAT_ID" ] && send_telegram "$title" "$message"
 
-    # Always print to terminal
+    # Always print to terminal. Colors go through %b, data through %s, so a
+    # backslash in the URL or the message is printed as is.
     echo ""
-    echo -e "${RED}${BOLD}╔══════════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${RED}${BOLD}║  🔔  CHANGE DETECTED                                        ║${NC}"
-    echo -e "${RED}${BOLD}╚══════════════════════════════════════════════════════════════╝${NC}"
-    echo -e "  ${BOLD}URL:${NC}  $URL"
-    echo -e "  ${BOLD}Time:${NC} $(date '+%Y-%m-%d %H:%M:%S')"
-    echo -e "  ${BOLD}Info:${NC} $message"
+    printf '%b%s%b\n' "${RED}${BOLD}" "╔══════════════════════════════════════════════════════════════╗" "$NC"
+    printf '%b%s%b\n' "${RED}${BOLD}" "║  🔔  CHANGE DETECTED                                         ║" "$NC"
+    printf '%b%s%b\n' "${RED}${BOLD}" "╚══════════════════════════════════════════════════════════════╝" "$NC"
+    printf '  %bURL:%b  %s\n' "$BOLD" "$NC" "$URL"
+    printf '  %bTime:%b %s\n' "$BOLD" "$NC" "$(date '+%Y-%m-%d %H:%M:%S')"
+    printf '  %bInfo:%b %s\n' "$BOLD" "$NC" "$message"
     echo ""
 }
 
@@ -1097,53 +1100,59 @@ save_snapshot() {
 
 # --- Progress / Status ---
 
+# config_line <label> <value> — the value is user data, printed with %s so
+# its backslashes are not interpreted.
+config_line() {
+    printf '  %b%-12s%b%s\n' "$CYAN" "$1" "$NC" "$2"
+}
+
 print_watch_config() {
     [ "$QUIET" = true ] && return
 
-    echo -e "${BOLD}Configuration:${NC}"
-    echo -e "  ${CYAN}URL:${NC}        $URL"
-    echo -e "  ${CYAN}Method:${NC}     $METHOD"
-    echo -e "  ${CYAN}Mode:${NC}       $MODE"
+    printf '%bConfiguration:%b\n' "$BOLD" "$NC"
+    config_line "URL:" "$URL"
+    config_line "Method:" "$METHOD"
+    config_line "Mode:" "$MODE"
     if [ "$MODE" = website ] || [ "$MODE" = auto ]; then
-        echo -e "  ${CYAN}Stripper:${NC}   $(resolve_html_stripper)"
+        config_line "Stripper:" "$(resolve_html_stripper)"
         if [ "$FULL_PAGE" = true ]; then
-            echo -e "  ${CYAN}Page:${NC}       full page"
+            config_line "Page:" "full page"
         else
-            echo -e "  ${CYAN}Page:${NC}       main content (use --full-page to keep chrome)"
+            config_line "Page:" "main content (use --full-page to keep chrome)"
         fi
     fi
-    echo -e "  ${CYAN}Interval:${NC}   ${INTERVAL}s"
+    config_line "Interval:" "${INTERVAL}s"
     if [ "$THRESHOLD" != "0" ]; then
-        echo -e "  ${CYAN}Threshold:${NC}  ${THRESHOLD}%"
+        config_line "Threshold:" "${THRESHOLD}%"
     else
-        echo -e "  ${CYAN}Threshold:${NC}  any change"
+        config_line "Threshold:" "any change"
     fi
     if [ ${#HEADERS[@]} -gt 0 ]; then
-        echo -e "  ${CYAN}Headers:${NC}    ${#HEADERS[@]} custom header(s)"
+        config_line "Headers:" "${#HEADERS[@]} custom header(s)"
     fi
     if [ -n "$JQ_FILTER" ]; then
-        echo -e "  ${CYAN}Filter:${NC}     $JQ_FILTER"
+        config_line "Filter:" "$JQ_FILTER"
     fi
     if [ -n "$SELECTOR" ]; then
-        echo -e "  ${CYAN}Selector:${NC}   $SELECTOR"
+        config_line "Selector:" "$SELECTOR"
     fi
     if [ ${#IGNORE_PATTERNS[@]} -gt 0 ]; then
-        echo -e "  ${CYAN}Ignore:${NC}     ${#IGNORE_PATTERNS[@]} pattern(s)"
+        config_line "Ignore:" "${#IGNORE_PATTERNS[@]} pattern(s)"
     fi
     if [ -n "$BODY" ]; then
-        echo -e "  ${CYAN}Body:${NC}       (${#BODY} bytes)"
+        config_line "Body:" "(${#BODY} bytes)"
     fi
     if [ -n "$LOG_FILE" ]; then
-        echo -e "  ${CYAN}Log:${NC}        $LOG_FILE"
+        config_line "Log:" "$LOG_FILE"
     fi
     if [ -n "$SNAPSHOT_DIR" ]; then
-        echo -e "  ${CYAN}Snapshots:${NC}  $SNAPSHOT_DIR"
+        config_line "Snapshots:" "$SNAPSHOT_DIR"
     fi
     if [ -n "$BASELINE_FILE" ]; then
-        echo -e "  ${CYAN}Baseline:${NC}   $BASELINE_FILE"
+        config_line "Baseline:" "$BASELINE_FILE"
     fi
     if [ "$MAX_RUNS" -gt 0 ]; then
-        echo -e "  ${CYAN}Max runs:${NC}   $MAX_RUNS"
+        config_line "Max runs:" "$MAX_RUNS"
     fi
     # Notification channels
     local channels=()
@@ -1155,7 +1164,7 @@ print_watch_config() {
         for c in "${channels[@]}"; do
             joined="${joined:+$joined, }$c"
         done
-        echo -e "  ${CYAN}Notify:${NC}     $joined"
+        config_line "Notify:" "$joined"
     fi
     echo ""
 }
@@ -1172,7 +1181,9 @@ wait_sleep() {
 
 print_countdown() {
     local remaining="$1"
-    if [ "$QUIET" = true ]; then
+    # A countdown redrawn with "\r" only makes sense on a terminal; in a log
+    # file, a cron mail or an agent transcript it is noise.
+    if [ "$QUIET" = true ] || [ "$IS_TTY" = false ]; then
         wait_sleep "$remaining"
         return
     fi
@@ -1334,7 +1345,10 @@ main() {
             local elapsed=$(( $(date +%s) - start_time ))
             local elapsed_fmt
             elapsed_fmt=$(printf '%02d:%02d:%02d' $((elapsed/3600)) $((elapsed%3600/60)) $((elapsed%60)))
-            [ "$QUIET" = false ] && printf "\r  ${DIM}[%s] Check #%d — No change (uptime: %s)${NC}\n" "$ts" "$run_count" "$elapsed_fmt"
+            # "\r" overwrites the countdown, which is only drawn on a terminal.
+            local cr=""
+            [ "$IS_TTY" = true ] && cr=$'\r'
+            [ "$QUIET" = false ] && printf "%s  ${DIM}[%s] Check #%d — No change (uptime: %s)${NC}\n" "$cr" "$ts" "$run_count" "$elapsed_fmt"
             log_verbose "No change (${#current_content} bytes)"
         else
             # Calculate change percentage

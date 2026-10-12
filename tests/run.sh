@@ -1202,6 +1202,41 @@ t_interrupt_leaves_no_temp_files() {
     assert_eq "$(find "$TMP/extract-tmp" -mindepth 1 | wc -l | tr -d ' ')" "0"
 }
 
+t_no_countdown_when_not_a_tty() {
+    # Cron, agents and "> file" capture stdout: no countdown, no carriage return.
+    ww -i 1 -n 2 "$BASE/a.json"
+    assert_rc 0
+    assert_contains "$OUT" "No change"
+    assert_not_contains "$OUT" "Next check"
+    assert_not_contains "$OUT" "$(printf '\r')"
+}
+
+t_backslashes_in_user_input_printed_verbatim() {
+    ww --once -s 'price\b' "$BASE/a.json"
+    assert_rc 0
+    assert_contains "$OUT" 'Selector:   price\b'
+    assert_not_contains "$OUT" "$(printf '\b')"
+
+    trigger_change "$BASE/a.json?q=a\tb"
+    assert_rc 2
+    assert_contains "$OUT" 'URL:        '"$BASE"'/a.json?q=a\tb'
+    assert_contains "$OUT" 'detected on '"$BASE"'/a.json?q=a\tb'
+    assert_not_contains "$OUT" "$(printf '\t')"
+}
+
+t_change_box_is_aligned() {
+    trigger_change "$BASE/a.json"
+    assert_rc 2
+    local widths
+    widths=$(printf '%s\n' "$OUT" | "$PYTHON" -c '
+import sys, unicodedata
+for line in sys.stdin.buffer.read().decode("utf-8").splitlines():
+    if line[:1] in ("╔", "║", "╚"):
+        print(sum(2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in line))
+' | sort -u)
+    assert_eq "$widths" "64"
+}
+
 # --- Runner -------------------------------------------------------------------
 
 ALL_TESTS=$(declare -F | awk '{print $3}' | grep '^t_')
