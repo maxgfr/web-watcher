@@ -91,13 +91,13 @@ sudo pacman -S curl jq
 Install the [web-watcher skill](skills/web-watcher/SKILL.md) with the [skills CLI](https://github.com/vercel-labs/skills):
 
 ```bash
-npx skills add maxgfr/web-watcher --skill web-watcher
+npx skills add maxgfr/web-watcher
 ```
 
-For a global Codex installation:
+It works with any skills-compatible agent. Add `-a <agent>` (for example `-a codex` or `-a opencode`) to target one agent explicitly, and `--global` to install it across projects:
 
 ```bash
-npx skills add maxgfr/web-watcher --skill web-watcher --agent codex --global
+npx skills add maxgfr/web-watcher --global
 ```
 
 The skill is model-invocable **on request**: its description restricts it to explicit requests, so the agent calls it when you ask for it, not on its own. Ask in plain words, or invoke it as `$web-watcher` in Codex or `/web-watcher` in Claude Code, for example:
