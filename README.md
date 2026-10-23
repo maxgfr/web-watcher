@@ -114,7 +114,7 @@ To make it explicit-only again:
 | --- | --- | --- |
 | Claude Code, OpenCode | no `disable-model-invocation` in `SKILL.md` | add `disable-model-invocation: true` |
 
-Claude Code can do it without touching the file: `"skillOverrides": { "web-watcher": "user-invocable-only" }` in `settings.json` leaves `/web-watcher` working while hiding the skill from the model. Plugin installs ignore `skillOverrides`, so edit the frontmatter there. Updating or reinstalling restores the shipped default, so reapply the change afterwards.
+Claude Code can do it without touching the file: `"skillOverrides": { "web-watcher": "user-invocable-only" }` in `settings.json` leaves `/web-watcher` working while hiding the skill from the model. Updating or reinstalling restores the shipped default, so reapply the change afterwards.
 
 ## Usage
 
